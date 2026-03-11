@@ -7,7 +7,6 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 """
 
 import logging
-import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -41,7 +40,6 @@ from app.services.ai_dispatcher import (
     INTERCEPT_MODE_PROMPTER,
     process_incoming_client_message,
 )
-from app.services.telegram_dev_tunnel import TelegramDevTunnelManager
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
 from app.services.openai_service import generate_draft, transcribe_voice
 from app.api.endpoints import ai as ai_endpoints
@@ -69,9 +67,6 @@ class _SuppressPollingFilter(logging.Filter):
 logging.getLogger("uvicorn.access").addFilter(_SuppressPollingFilter())
 
 LOCAL_FRONTEND_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
-
-telegram_dev_tunnel = TelegramDevTunnelManager()
-telegram_dev_tunnel_start_task: asyncio.Task | None = None
 
 
 async def _get_table_columns(conn, table: str) -> set[str]:
@@ -151,23 +146,13 @@ async def seed_default_operator() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global telegram_dev_tunnel_start_task
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await ensure_conversation_runtime_columns()
     await seed_default_operator()
     await register_telegram_webhook_on_startup()
-    log.info("FastAPI startup complete, initializing Telegram tunnel automation")
-    telegram_dev_tunnel_start_task = asyncio.create_task(
-        telegram_dev_tunnel.start(),
-        name="telegram-dev-tunnel-start",
-    )
+    log.info("FastAPI startup complete")
     yield
-    log.info("FastAPI shutdown, stopping Telegram tunnel automation")
-    if telegram_dev_tunnel_start_task is not None and not telegram_dev_tunnel_start_task.done():
-        telegram_dev_tunnel_start_task.cancel()
-        telegram_dev_tunnel_start_task = None
-    await telegram_dev_tunnel.stop()
 
 
 # ── FastAPI приложение ────────────────────────────────────────────────────
@@ -561,4 +546,6 @@ async def delete_conversation(
 
 # ── Запуск ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
