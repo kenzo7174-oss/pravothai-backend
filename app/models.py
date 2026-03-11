@@ -1,0 +1,120 @@
+"""
+Axoloti Terminal — ORM-модели омниканальной CRM.
+"""
+
+from datetime import datetime, timezone
+from typing import List
+
+from sqlalchemy import (
+    Integer,
+    String,
+    Text,
+    Boolean,
+    DateTime,
+    ForeignKey,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.core.database import Base
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  OPERATOR — Оператор (JWT-аутентификация)
+# ═══════════════════════════════════════════════════════════════════════════
+class Operator(Base):
+    __tablename__ = "operators"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<Operator #{self.id} {self.username}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CLIENT — Карточка клиента
+# ═══════════════════════════════════════════════════════════════════════════
+class Client(Base):
+    __tablename__ = "clients"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    avatar: Mapped[str] = mapped_column(String(500), default="")
+    
+    # 🟢 КОНТАКТЫ И ПРОФИЛЬ (Добавлены новые поля)
+    phone: Mapped[str] = mapped_column(String(50), index=True, default="")
+    email: Mapped[str] = mapped_column(String(255), default="")
+    location: Mapped[str] = mapped_column(String(255), default="")       # Город/Страна
+    website: Mapped[str] = mapped_column(String(255), default="")        # Сайт/Соцсеть
+    device_info: Mapped[str] = mapped_column(String(255), default="")    # Данные системы
+    
+    notes: Mapped[str] = mapped_column(Text, default="")
+    tags: Mapped[str] = mapped_column(String(500), default="")
+
+    # Управление списком
+    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, 
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+    conversations: Mapped[List["Conversation"]] = relationship(
+        back_populates="client",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Client #{self.id} {self.name}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONVERSATION — Диалог
+# ═══════════════════════════════════════════════════════════════════════════
+class Conversation(Base):
+    __tablename__ = "conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False)
+
+    source: Mapped[str] = mapped_column(String(30), nullable=False)
+    social_id: Mapped[str] = mapped_column(String(120), default="")
+    label: Mapped[str] = mapped_column(String(255), default="")
+    intercept_mode: Mapped[str] = mapped_column(String(30), default="bot")
+    pending_draft: Mapped[str] = mapped_column(Text, default="")
+    pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    messages: Mapped[List["Message"]] = relationship(
+        back_populates="conversation",
+        lazy="selectin",
+        cascade="all, delete-orphan",
+        order_by="Message.created_at",
+    )
+
+    client: Mapped["Client"] = relationship(back_populates="conversations")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  MESSAGE — Сообщение
+# ═══════════════════════════════════════════════════════════════════════════
+class Message(Base):
+    __tablename__ = "messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), nullable=False)
+
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    sender: Mapped[str] = mapped_column(String(20), nullable=False)
+    
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    conversation: Mapped["Conversation"] = relationship(back_populates="messages")
