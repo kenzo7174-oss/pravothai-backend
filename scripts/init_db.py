@@ -10,14 +10,14 @@ Axoloti Terminal — Инициализация базы данных и заг�
 """
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from app.core.database import engine, AsyncSessionLocal, Base
 from app.models import Client, Conversation, Message
 
 
 # ── Вспомогательные временные метки ──────────────────────────────────────
-NOW = datetime.now(timezone.utc)
+NOW = datetime.utcnow()
 YESTERDAY = NOW - timedelta(days=1)
 THIS_MORNING = NOW.replace(hour=9, minute=15, second=0, microsecond=0)
 FIVE_MIN_AGO = NOW - timedelta(minutes=5)
