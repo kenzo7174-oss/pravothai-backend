@@ -66,8 +66,6 @@ class _SuppressPollingFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_SuppressPollingFilter())
 
-LOCAL_FRONTEND_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
-
 
 async def _get_table_columns(conn, table: str) -> set[str]:
     """Возвращает множество имён колонок таблицы (SQLite или PostgreSQL)."""
@@ -168,9 +166,14 @@ app.include_router(ai_endpoints.router, prefix="/api/v1")
 # ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=LOCAL_FRONTEND_ORIGIN_REGEX,
+    allow_origins=[
+        "http://axoloti.ru",
+        "https://axoloti.ru",
+        "http://www.axoloti.ru",
+        "https://www.axoloti.ru",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -546,6 +549,4 @@ async def delete_conversation(
 
 # ── Запуск ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
-
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
