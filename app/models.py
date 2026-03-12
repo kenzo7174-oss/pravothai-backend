@@ -2,7 +2,7 @@
 Axoloti Terminal — ORM-модели омниканальной CRM.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import List
 
 from sqlalchemy import (
@@ -57,8 +57,8 @@ class Client(Base):
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
     
     created_at: Mapped[datetime] = mapped_column(
-        DateTime, 
-        default=lambda: datetime.now(timezone.utc)
+        DateTime,
+        default=datetime.utcnow,
     )
 
     conversations: Mapped[List["Conversation"]] = relationship(
@@ -112,7 +112,7 @@ class Message(Base):
     
     created_at: Mapped[datetime] = mapped_column(
         DateTime,
-        default=lambda: datetime.now(timezone.utc),
+        default=datetime.utcnow,
     )
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
