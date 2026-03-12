@@ -167,12 +167,7 @@ app.include_router(ai_endpoints.router, prefix="/api/v1")
 # ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://axoloti.ru",
-        "https://axoloti.ru",
-        "http://www.axoloti.ru",
-        "https://www.axoloti.ru",
-    ],
+    allow_origin_regex=r".*",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
@@ -523,10 +518,22 @@ async def web_widget_webhook(
     thread_id_raw = body.get("thread_id")
     conv = None
 
+    def _parse_thread_id_int(value) -> int | None:
+        """Безопасное извлечение integer из thread_id (например, 'conv-123' или '123')."""
+        if value is None:
+            return None
+        s = str(value).strip().replace("conv-", "").replace("conv_", "").strip()
+        if not s or not s.isdigit():
+            return None
+        try:
+            return int(s)
+        except (ValueError, TypeError):
+            return None
+
     if thread_id_raw:
-        raw_id = str(thread_id_raw).replace("conv-", "").strip()
-        if raw_id.isdigit():
-            conv = await session.get(Conversation, int(raw_id))
+        conv_id = _parse_thread_id_int(thread_id_raw)
+        if conv_id is not None:
+            conv = await session.get(Conversation, conv_id)
         if conv is None:
             result = await session.execute(
                 select(Conversation).where(
@@ -583,12 +590,13 @@ async def web_widget_webhook(
         ai_msg = Message(
             conversation_id=conv.id,
             content=draft,
-            sender="assistant",
+            sender="bot",
             is_read=False,
             is_voice=False,
         )
         session.add(ai_msg)
         await session.commit()
+        await session.refresh(ai_msg)
 
     return {
         "reply": draft or "Извините, не удалось сформировать ответ. Попробуйте позже.",
