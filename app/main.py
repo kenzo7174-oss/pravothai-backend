@@ -7,6 +7,7 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 """
 
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -494,6 +495,105 @@ async def telegram_webhook(
         background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
 
     return {"ok": True}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  API v1 — Web Widget Webhook
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/webhooks/web")
+async def web_widget_webhook(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Принимает сообщения с веб-виджета на сайте.
+
+    JSON: { "message": str, "thread_id"?: str }
+    Возвращает: { "reply": str, "thread_id": str }
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    text = (body.get("message") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    thread_id_raw = body.get("thread_id")
+    conv = None
+
+    if thread_id_raw:
+        raw_id = str(thread_id_raw).replace("conv-", "").strip()
+        if raw_id.isdigit():
+            conv = await session.get(Conversation, int(raw_id))
+        if conv is None:
+            result = await session.execute(
+                select(Conversation).where(
+                    Conversation.source == "web",
+                    Conversation.social_id == str(thread_id_raw),
+                )
+            )
+            conv = result.scalar_one_or_none()
+
+    if conv is None:
+        client = Client(
+            name="Посетитель сайта",
+            avatar="",
+            phone="",
+            email="",
+            website="",
+            notes="",
+            tags="web",
+        )
+        session.add(client)
+        await session.flush()
+
+        session_id = str(uuid.uuid4())
+        conv = Conversation(
+            client_id=client.id,
+            source="web",
+            social_id=session_id,
+            label="Web: Посетитель сайта",
+        )
+        session.add(conv)
+        await session.flush()
+
+    msg = Message(
+        conversation_id=conv.id,
+        content=text,
+        sender="client",
+        is_read=False,
+        is_voice=False,
+    )
+    session.add(msg)
+    await session.commit()
+    await session.refresh(msg)
+
+    result = await session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.desc())
+        .limit(10)
+    )
+    recent = list(reversed(result.scalars().all()))
+    draft = await generate_draft(recent)
+
+    if draft:
+        ai_msg = Message(
+            conversation_id=conv.id,
+            content=draft,
+            sender="assistant",
+            is_read=False,
+            is_voice=False,
+        )
+        session.add(ai_msg)
+        await session.commit()
+
+    return {
+        "reply": draft or "Извините, не удалось сформировать ответ. Попробуйте позже.",
+        "thread_id": f"conv-{conv.id}",
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
