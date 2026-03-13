@@ -44,9 +44,10 @@ class Client(Base):
     
     # 🟢 КОНТАКТЫ И ПРОФИЛЬ (Добавлены новые поля)
     phone: Mapped[str] = mapped_column(String(50), index=True, default="")
-    email: Mapped[str] = mapped_column(String(255), default="")
+    email: Mapped[str] = mapped_column(String(255), index=True, default="")
+    social_link: Mapped[str] = mapped_column(String(500), default="")   # vk/t.me/instagram/сайт (глобус)
     location: Mapped[str] = mapped_column(String(255), default="")       # Город/Страна
-    website: Mapped[str] = mapped_column(String(255), default="")        # Сайт/Соцсеть
+    website: Mapped[str] = mapped_column(String(255), default="")        # Сайт/Соцсеть (legacy)
     device_info: Mapped[str] = mapped_column(String(255), default="")    # Данные системы (legacy)
 
     # 🟢 ВЕБ-ВИДЖЕТ: склейка клиентов и техданные
