@@ -17,8 +17,18 @@ from app.services.telegram import send_telegram_message
 
 log = logging.getLogger(__name__)
 
+# Режимы перехвата (импортируются в main.py)
 INTERCEPT_MODE_BOT = "bot"
 INTERCEPT_MODE_PROMPTER = "prompter"
+INTERCEPT_MODE_MANUAL = "manual"
+INTERCEPT_MODE_SENIOR = "senior"
+
+VALID_INTERCEPT_MODES = frozenset({
+    INTERCEPT_MODE_BOT,
+    INTERCEPT_MODE_PROMPTER,
+    INTERCEPT_MODE_MANUAL,
+    INTERCEPT_MODE_SENIOR,
+})
 
 
 async def process_incoming_client_message(
