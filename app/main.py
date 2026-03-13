@@ -1104,24 +1104,31 @@ async def merge_client(
     if source.id == target.id:
         raise HTTPException(status_code=400, detail="Cannot merge client with itself")
 
-    # Перепривязываем все диалоги source → target
+    # 1. СНАЧАЛА перепривязываем все диалоги source → target
     r = await session.execute(select(Conversation).where(Conversation.client_id == source.id))
     conversations = r.scalars().all()
     for conv in conversations:
         conv.client_id = target.id
 
     log.info(
-        "DEBUG MERGE: source=%s, target=%s, updated_chats=%s",
+        "merge_client: source=%s → target=%s, conversations=%s",
         client_id,
         body.target_client_id,
         len(conversations),
     )
 
-    # Склеиваем заметки
+    # 2. Перепривязываем заметки (склеиваем в target)
     if source.notes and source.notes.strip():
         existing = (target.notes or "").strip()
         target.notes = (existing + "\n\n---\n" + source.notes) if existing else source.notes
 
+    # 3. Промежуточный flush — БД должна зафиксировать перепривязку ДО удаления
+    await session.flush()
+
+    # 4. Сбрасываем кэш relationship, чтобы при delete не каскадировало на уже перепривязанные диалоги
+    session.expire(source, ["conversations"])
+
+    # 5. ТОЛЬКО после успешного flush — удаляем source и коммитим
     await session.delete(source)
     await session.commit()
     await session.refresh(target, attribute_names=["conversations"])
