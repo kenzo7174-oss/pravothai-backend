@@ -26,7 +26,14 @@ from app.core.auth import (
     create_access_token,
     get_current_operator,
 )
-from app.models import Client, Conversation, Message, Operator
+from app.models import (
+    Client,
+    Conversation,
+    Message,
+    Operator,
+    SystemSettings,
+    DEFAULT_SENIOR_WELCOME_MESSAGE,
+)
 from app.schemas import (
     ClientSchema,
     ClientUpdate,
@@ -34,6 +41,8 @@ from app.schemas import (
     LoginRequest,
     MessageCreate,
     MessageSchema,
+    SystemSettingsSchema,
+    SystemSettingsUpdate,
     TokenResponse,
 )
 from app.services.ai_dispatcher import (
@@ -216,6 +225,56 @@ async def login(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  API v1 — Системные настройки (Singleton id=1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/settings", response_model=SystemSettingsSchema)
+async def get_settings(
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Возвращает текущие системные настройки. Если записи нет — создаёт дефолтную (id=1)."""
+    result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+    settings = result.scalar_one_or_none()
+    if not settings:
+        settings = SystemSettings(
+            id=1,
+            senior_welcome_message=DEFAULT_SENIOR_WELCOME_MESSAGE,
+        )
+        session.add(settings)
+        await session.commit()
+        await session.refresh(settings)
+    return SystemSettingsSchema(
+        senior_welcome_message=settings.senior_welcome_message,
+    )
+
+
+@app.patch("/api/v1/settings", response_model=SystemSettingsSchema)
+async def patch_settings(
+    body: SystemSettingsUpdate,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Обновляет запись системных настроек (id=1)."""
+    result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+    settings = result.scalar_one_or_none()
+    if not settings:
+        settings = SystemSettings(
+            id=1,
+            senior_welcome_message=DEFAULT_SENIOR_WELCOME_MESSAGE,
+        )
+        session.add(settings)
+        await session.flush()
+    if body.senior_welcome_message is not None:
+        settings.senior_welcome_message = body.senior_welcome_message
+    await session.commit()
+    await session.refresh(settings)
+    return SystemSettingsSchema(
+        senior_welcome_message=settings.senior_welcome_message,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  API v1 — Клиенты
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -317,7 +376,13 @@ def _normalize_intercept_mode(mode: str | None) -> str:
     return INTERCEPT_MODE_BOT
 
 
-SENIOR_NOTIFICATION_TEXT = "К диалогу подключился старший специалист."
+async def _get_senior_welcome_message(session: AsyncSession) -> str:
+    """Возвращает приветственное сообщение для режима senior из SystemSettings."""
+    result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+    settings = result.scalar_one_or_none()
+    if settings:
+        return settings.senior_welcome_message
+    return DEFAULT_SENIOR_WELCOME_MESSAGE
 
 
 @app.patch("/api/v1/conversations/{conversation_id}/intercept-mode")
@@ -343,11 +408,12 @@ async def update_intercept_mode(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
 
-    # При переключении на senior — отправляем уведомление клиенту
+    # При переключении на senior — отправляем уведомление клиенту (из SystemSettings)
     if conv.intercept_mode == INTERCEPT_MODE_SENIOR:
+        senior_text = await _get_senior_welcome_message(session)
         sys_msg = Message(
             conversation_id=conv.id,
-            content=SENIOR_NOTIFICATION_TEXT,
+            content=senior_text,
             sender="bot",
             is_read=False,
             is_voice=False,
@@ -356,7 +422,7 @@ async def update_intercept_mode(
         await session.flush()
 
         if conv.source == "telegram" and conv.social_id:
-            ok = await send_telegram_message(conv.social_id, SENIOR_NOTIFICATION_TEXT)
+            ok = await send_telegram_message(conv.social_id, senior_text)
             if not ok:
                 log.warning(
                     "Уведомление senior сохранено в БД, но не отправлено в Telegram (conv=%s)",
