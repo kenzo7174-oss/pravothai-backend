@@ -7,6 +7,7 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 """
 
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -36,6 +37,7 @@ from app.models import (
     DEFAULT_SENIOR_WELCOME_MESSAGE,
 )
 from app.schemas import (
+    ClientMergeRequest,
     ClientSchema,
     ClientUpdate,
     InterceptModeUpdate,
@@ -78,6 +80,108 @@ class _SuppressPollingFilter(logging.Filter):
 
 
 logging.getLogger("uvicorn.access").addFilter(_SuppressPollingFilter())
+
+
+def _extract_contacts_from_text(text: str) -> dict[str, str]:
+    """Извлекает email, телефон и соцссылки из текста сообщения. Возвращает dict с ключами email, phone, social_link."""
+    result: dict[str, str] = {"email": "", "phone": "", "social_link": ""}
+    if not text or not isinstance(text, str):
+        return result
+
+    # Email: стандартный паттерн
+    email_match = re.search(
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        text,
+    )
+    if email_match:
+        result["email"] = email_match.group(0).strip()
+
+    # Телефон: с плюсом и без (7-15 цифр, возможны пробелы, скобки, дефисы)
+    phone_match = re.search(
+        r"(?:\+?\d[\d\s\-()]{8,20}\d|\d{10,15})",
+        text,
+    )
+    if phone_match:
+        raw = re.sub(r"[\s\-()]", "", phone_match.group(0))
+        if len(raw) >= 10:
+            result["phone"] = ("+" + raw) if not raw.startswith("+") else raw
+
+    # Соцсети и сайты: vk.com, t.me, instagram.com или личные домены (http/https)
+    social_pattern = (
+        r"(?:https?://)?(?:"
+        r"(?:vk\.com/[\w.]+)|"
+        r"(?:t\.me/[\w]+)|"
+        r"(?:instagram\.com/[\w.]+)|"
+        r"(?:www\.)?[a-zA-Z0-9][-a-zA-Z0-9.]*\.[a-zA-Z]{2,}(?:/[^\s]*)?"
+        r")"
+    )
+    social_match = re.search(social_pattern, text, re.IGNORECASE)
+    if social_match:
+        link = social_match.group(0).strip()
+        if not link.startswith("http"):
+            link = "https://" + link
+        result["social_link"] = link
+
+    return result
+
+
+async def _apply_contacts_and_auto_merge(
+    session: AsyncSession,
+    client: Client,
+    message_text: str,
+) -> Client:
+    """
+    Извлекает контакты из текста, сохраняет в профиль клиента.
+    Если найден другой клиент с таким же email или phone — склеивает диалоги
+    (перепривязывает к старому клиенту, удаляет дубль).
+    Возвращает итогового клиента (либо текущего, либо того, с кем склеили).
+    """
+    contacts = _extract_contacts_from_text(message_text)
+    if contacts.get("email") and not client.email:
+        client.email = contacts["email"]
+    if contacts.get("phone") and not client.phone:
+        client.phone = contacts["phone"]
+    if contacts.get("social_link") and not client.social_link:
+        client.social_link = contacts["social_link"]
+    await session.flush()
+
+    # Авто-склейка: ищем другого клиента с тем же email или phone
+    other_client = None
+    if client.email:
+        r = await session.execute(
+            select(Client).where(
+                Client.email == client.email,
+                Client.id != client.id,
+            )
+        )
+        other_client = r.scalar_one_or_none()
+    if other_client is None and client.phone:
+        r = await session.execute(
+            select(Client).where(
+                Client.phone == client.phone,
+                Client.id != client.id,
+            )
+        )
+        other_client = r.scalar_one_or_none()
+
+    if other_client is None:
+        return client
+
+    # Найден старый клиент — перепривязываем все диалоги и заметки
+    target = other_client
+    r = await session.execute(
+        select(Conversation).where(Conversation.client_id == client.id)
+    )
+    for conv in r.scalars().all():
+        conv.client_id = target.id
+    if client.notes and client.notes.strip():
+        target.notes = (target.notes or "").strip()
+        target.notes = (
+            (target.notes + "\n\n---\n" + client.notes) if target.notes else client.notes
+        )
+    await session.delete(client)
+    await session.flush()
+    return target
 
 
 async def _get_table_columns(conn, table: str) -> set[str]:
@@ -146,6 +250,10 @@ async def ensure_conversation_runtime_columns() -> None:
         if "ip" not in client_columns:
             await conn.execute(text(
                 "ALTER TABLE clients ADD COLUMN ip VARCHAR(45) NOT NULL DEFAULT ''"
+            ))
+        if "social_link" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN social_link VARCHAR(500) NOT NULL DEFAULT ''"
             ))
 
 
@@ -598,6 +706,7 @@ async def telegram_webhook(
             avatar="",
             phone="",
             email="",
+            social_link="",
             website=f"@{username}" if username else "",
             notes="",
             tags="telegram",
@@ -614,9 +723,7 @@ async def telegram_webhook(
         session.add(conv)
         await session.flush()
     else:
-        # Для уже существующего клиента webhook должен только добавлять Message.
-        # Не восстанавливаем source-tag и не трогаем операторские правки профиля.
-        pass
+        client = await session.get(Client, conv.client_id)
 
     # ── Сохраняем входящее сообщение ─────────────────────────────────────
     msg = Message(
@@ -627,6 +734,12 @@ async def telegram_webhook(
         is_voice=is_voice,
     )
     session.add(msg)
+    await session.flush()
+
+    # Извлечение контактов и авто-склейка с дублем по email/phone
+    if client:
+        await _apply_contacts_and_auto_merge(session, client, text)
+
     await session.commit()
     await session.refresh(msg)
 
@@ -846,6 +959,7 @@ async def web_widget_webhook(
             avatar="",
             phone="",
             email="",
+            social_link="",
             website="",
             notes="",
             tags="web",
@@ -910,6 +1024,13 @@ async def web_widget_webhook(
         is_voice=False,
     )
     session.add(msg)
+    await session.flush()
+
+    # Извлечение контактов и авто-склейка с дублем по email/phone
+    client = await session.get(Client, conv.client_id)
+    if client:
+        client = await _apply_contacts_and_auto_merge(session, client, text)
+
     await session.commit()
     await session.refresh(msg)
 
@@ -962,6 +1083,39 @@ async def update_client(
     await session.commit()
     await session.refresh(client, attribute_names=["conversations"])
     return client
+
+
+@app.post("/api/v1/clients/{client_id}/merge", response_model=ClientSchema)
+async def merge_client(
+    client_id: int,
+    body: ClientMergeRequest,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Объединяет клиента source с target: перепривязывает все диалоги и заметки, удаляет source."""
+    source = await session.get(Client, client_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Client not found")
+    target = await session.get(Client, body.target_client_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target client not found")
+    if source.id == target.id:
+        raise HTTPException(status_code=400, detail="Cannot merge client with itself")
+
+    # Перепривязываем все диалоги source → target
+    r = await session.execute(select(Conversation).where(Conversation.client_id == source.id))
+    for conv in r.scalars().all():
+        conv.client_id = target.id
+
+    # Склеиваем заметки
+    if source.notes and source.notes.strip():
+        existing = (target.notes or "").strip()
+        target.notes = (existing + "\n\n---\n" + source.notes) if existing else source.notes
+
+    await session.delete(source)
+    await session.commit()
+    await session.refresh(target, attribute_names=["conversations"])
+    return target
 
 
 @app.delete("/api/v1/conversations/{conversation_id}", status_code=204)
