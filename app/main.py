@@ -1162,6 +1162,45 @@ async def delete_conversation(
     await session.commit()
 
 
+@app.post("/api/v1/conversations/{conversation_id}/detach", status_code=200)
+async def detach_conversation(
+    conversation_id: int,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Отвязывает диалог от текущего клиента: создаёт нового пустого клиента
+    и перепривязывает conversation к нему. Диалог становится отдельным чатом."""
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    new_client = Client(
+        name="Посетитель сайта",
+        avatar="",
+        phone="",
+        email="",
+        social_link="",
+        website="",
+        notes="",
+        tags="",
+        axolotl_visitor_id="",
+        ip="",
+        browser="",
+        os_device="",
+    )
+    session.add(new_client)
+    await session.flush()
+
+    conv.client_id = new_client.id
+    if new_client.name == "Посетитель сайта":
+        new_client.name = f"Посетитель #{new_client.id}"
+        await session.flush()
+
+    await session.commit()
+
+    return {"conversation_id": conv.id, "new_client_id": new_client.id}
+
+
 # ── Запуск ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
