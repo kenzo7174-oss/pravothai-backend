@@ -643,12 +643,19 @@ async def telegram_webhook(
 
 def _get_client_ip(request: Request) -> str:
     """Извлекает реальный IP клиента. Учитывает Render: X-Forwarded-For, X-Real-IP."""
-    forwarded = request.headers.get("X-Forwarded-For")
-    if forwarded:
+    headers = {
+        "X-Forwarded-For": request.headers.get("X-Forwarded-For"),
+        "X-Real-IP": request.headers.get("X-Real-IP"),
+    }
+    print(f"DEBUG IP: {headers}")
+    forwarded = headers["X-Forwarded-For"]
+    if forwarded and forwarded.strip():
         # Первый адрес в списке — клиент, остальные — прокси
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("X-Real-IP")
-    if real_ip:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    real_ip = headers["X-Real-IP"]
+    if real_ip and real_ip.strip():
         return real_ip.strip()
     if request.client:
         return request.client.host or ""
@@ -656,7 +663,7 @@ def _get_client_ip(request: Request) -> str:
 
 
 async def _fetch_geolocation(ip: str) -> str:
-    """Получает геолокацию по IP через ip-api.com. При ошибке возвращает пустую строку."""
+    """Получает геолокацию по IP через ip-api.com. При fail/ошибке — «Сеть клиента»."""
     if not ip or ip.startswith("127.") or ip == "::1":
         return "Локальная сеть"
     try:
@@ -667,14 +674,14 @@ async def _fetch_geolocation(ip: str) -> str:
             resp.raise_for_status()
             data = resp.json()
             if data.get("status") != "success":
-                return ""
+                return "Сеть клиента"
             city = data.get("city") or ""
             country = data.get("country") or ""
             parts = [p for p in (city, country) if p]
-            return ", ".join(parts) if parts else ""
+            return ", ".join(parts) if parts else "Сеть клиента"
     except Exception as exc:
         log.warning("GeoIP запрос не удался для %s: %s", ip, exc)
-        return ""
+        return "Сеть клиента"
 
 
 def _parse_user_agent(ua: str | None) -> tuple[str, str]:
@@ -832,9 +839,10 @@ async def web_widget_webhook(
             client.os_device = os_device
         await session.flush()
     else:
-        # Клиент НЕ найден — создаём нового и обязательно записываем axolotl_visitor_id
+        # Клиент НЕ найден — создаём нового. Имя по умолчанию: «Посетитель (Ижевск)» или «Посетитель #ID»
+        default_name = f"Посетитель ({location})" if location else "Посетитель сайта"
         client = Client(
-            name="Посетитель сайта",
+            name=default_name,
             avatar="",
             phone="",
             email="",
@@ -849,6 +857,9 @@ async def web_widget_webhook(
         )
         session.add(client)
         await session.flush()
+        if client.name == "Посетитель сайта":
+            client.name = f"Посетитель #{client.id}"
+            await session.flush()
 
     # Теперь ищем диалог для этого клиента
     thread_id_raw = body.get("thread_id")
