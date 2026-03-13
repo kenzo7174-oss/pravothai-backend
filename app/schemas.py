@@ -75,6 +75,7 @@ class ClientUpdate(BaseModel):
     phone: Optional[str] = None
     email: Optional[str] = None
     location: Optional[str] = None
+    ip: Optional[str] = None
     website: Optional[str] = None
     notes: Optional[str] = None
     tags: Optional[Union[str, list[str]]] = None
@@ -101,6 +102,7 @@ class ClientSchema(BaseModel):
     phone: str
     email: str
     location: str = ""
+    ip: str = ""
     website: str = ""
     device_info: str = ""
     browser: str = ""
