@@ -69,11 +69,17 @@ class SystemSettingsUpdate(BaseModel):
     senior_welcome_message: Optional[str] = None
 
 
+class ClientMergeRequest(BaseModel):
+    """Запрос на объединение клиента с другим."""
+    target_client_id: int
+
+
 class ClientUpdate(BaseModel):
     """Частичное обновление карточки клиента."""
     name: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
+    social_link: Optional[str] = None
     location: Optional[str] = None
     ip: Optional[str] = None
     website: Optional[str] = None
@@ -101,6 +107,7 @@ class ClientSchema(BaseModel):
     avatar: str
     phone: str
     email: str
+    social_link: str = ""
     location: str = ""
     ip: str = ""
     website: str = ""
