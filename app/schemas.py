@@ -78,6 +78,8 @@ class ClientUpdate(BaseModel):
     website: Optional[str] = None
     notes: Optional[str] = None
     tags: Optional[Union[str, list[str]]] = None
+    browser: Optional[str] = None
+    os_device: Optional[str] = None
 
     @field_validator("tags", mode="before")
     @classmethod
@@ -101,6 +103,8 @@ class ClientSchema(BaseModel):
     location: str = ""
     website: str = ""
     device_info: str = ""
+    browser: str = ""
+    os_device: str = ""
     notes: str
     tags: str
     conversations: list[ConversationSchema] = []
