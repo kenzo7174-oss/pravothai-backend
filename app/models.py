@@ -51,6 +51,7 @@ class Client(Base):
 
     # 🟢 ВЕБ-ВИДЖЕТ: склейка клиентов и техданные
     axolotl_visitor_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    ip: Mapped[str] = mapped_column(String(45), default="")  # IPv4/IPv6
     browser: Mapped[str] = mapped_column(String(64), default="")
     os_device: Mapped[str] = mapped_column(String(128), default="")
     
