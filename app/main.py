@@ -10,7 +10,7 @@ import logging
 import re
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request
@@ -169,21 +169,39 @@ async def _apply_contacts_and_auto_merge(
     if other_client is None:
         return client
 
-    # Найден старый клиент — перепривязываем все диалоги и заметки
-    target = other_client
+    # Найден старый клиент — перепривязываем все диалоги и заметки (безопасный паттерн как в /merge)
+    source_client = client
+    target_client = other_client
+
+    # 1. СНАЧАЛА перепривязываем все диалоги source → target
     r = await session.execute(
-        select(Conversation).where(Conversation.client_id == client.id)
+        select(Conversation).where(Conversation.client_id == source_client.id)
     )
     for conv in r.scalars().all():
-        conv.client_id = target.id
-    if client.notes and client.notes.strip():
-        target.notes = (target.notes or "").strip()
-        target.notes = (
-            (target.notes + "\n\n---\n" + client.notes) if target.notes else client.notes
+        conv.client_id = target_client.id
+
+    # 2. Перепривязываем заметки (склеиваем в target)
+    if source_client.notes and source_client.notes.strip():
+        existing = (target_client.notes or "").strip()
+        target_client.notes = (
+            (existing + "\n\n---\n" + source_client.notes) if existing else source_client.notes
         )
-    await session.delete(client)
+
+    # 3. Промежуточный flush — БД должна зафиксировать перепривязку ДО удаления
     await session.flush()
-    return target
+
+    # 4. Сбрасываем кэш relationship, чтобы при delete не каскадировало на уже перепривязанные диалоги
+    session.expire(source_client, ["conversations"])
+
+    # 5. ТОЛЬКО после успешного flush — удаляем source
+    await session.delete(source_client)
+
+    log.info(
+        "AUTO-MERGE SUCCESS: client %s merged into %s via contact match",
+        source_client.id,
+        target_client.id,
+    )
+    return target_client
 
 
 async def _get_table_columns(conn, table: str) -> set[str]:
@@ -510,6 +528,55 @@ def _normalize_intercept_mode(mode: str | None) -> str:
     return INTERCEPT_MODE_BOT
 
 
+OPERATOR_TIMEOUT_MINUTES = 15
+
+
+async def _check_and_auto_wakeup_manual_mode(
+    session: AsyncSession,
+    conv: Conversation,
+) -> bool:
+    """
+    Если режим manual/senior и оператор не писал > 15 мин — переключает на bot и возвращает True.
+    Иначе возвращает False.
+    """
+    if conv.intercept_mode not in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        return False
+
+    result = await session.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conv.id,
+            Message.sender == "operator",
+        )
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    last_op_msg = result.scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=OPERATOR_TIMEOUT_MINUTES)
+
+    if last_op_msg is None:
+        timed_out = True
+    else:
+        msg_ts = last_op_msg.created_at
+        if msg_ts.tzinfo is None:
+            msg_ts = msg_ts.replace(tzinfo=timezone.utc)
+        timed_out = msg_ts < cutoff
+
+    if not timed_out:
+        return False
+
+    conv.intercept_mode = INTERCEPT_MODE_BOT
+    await session.commit()
+    log.info(
+        "AUTO-WAKEUP: Client %s (conv %s) returned to AI mode (operator timeout)",
+        conv.client_id,
+        conv.id,
+    )
+    return True
+
+
 async def _get_senior_welcome_message(session: AsyncSession) -> str:
     """Возвращает приветственное сообщение для режима senior из SystemSettings."""
     result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
@@ -747,6 +814,10 @@ async def telegram_webhook(
 
     if conv.intercept_mode in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER}:
         background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
+    elif conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
+        if did_wakeup:
+            background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
 
     return {"ok": True}
 
@@ -1035,6 +1106,14 @@ async def web_widget_webhook(
 
     await session.commit()
     await session.refresh(msg)
+
+    if conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
+        if not did_wakeup:
+            return {
+                "reply": "Ожидайте ответа оператора.",
+                "thread_id": f"conv-{conv.id}",
+            }
 
     result = await session.execute(
         select(Message)
