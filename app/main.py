@@ -11,6 +11,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select, text
@@ -141,6 +142,10 @@ async def ensure_conversation_runtime_columns() -> None:
         if "os_device" not in client_columns:
             await conn.execute(text(
                 "ALTER TABLE clients ADD COLUMN os_device VARCHAR(128) NOT NULL DEFAULT ''"
+            ))
+        if "ip" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN ip VARCHAR(45) NOT NULL DEFAULT ''"
             ))
 
 
@@ -636,6 +641,42 @@ async def telegram_webhook(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _get_client_ip(request: Request) -> str:
+    """Извлекает реальный IP клиента. Учитывает Render: X-Forwarded-For, X-Real-IP."""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        # Первый адрес в списке — клиент, остальные — прокси
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    if request.client:
+        return request.client.host or ""
+    return ""
+
+
+async def _fetch_geolocation(ip: str) -> str:
+    """Получает геолокацию по IP через ip-api.com. При ошибке возвращает пустую строку."""
+    if not ip or ip.startswith("127.") or ip == "::1":
+        return "Локальная сеть"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"http://ip-api.com/json/{ip}?lang=ru",
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") != "success":
+                return ""
+            city = data.get("city") or ""
+            country = data.get("country") or ""
+            parts = [p for p in (city, country) if p]
+            return ", ".join(parts) if parts else ""
+    except Exception as exc:
+        log.warning("GeoIP запрос не удался для %s: %s", ip, exc)
+        return ""
+
+
 def _parse_user_agent(ua: str | None) -> tuple[str, str]:
     """Парсит userAgent в (os_device, browser). Возвращает понятные строки."""
     if not ua or not isinstance(ua, str):
@@ -644,21 +685,27 @@ def _parse_user_agent(ua: str | None) -> tuple[str, str]:
     os_device = ""
     browser = ""
     # OS/Device
-    if "iPhone" in ua or "iPad" in ua or "iPod" in ua:
-        os_device = "iPhone (iOS)" if "iPad" not in ua else "iPad (iOS)"
+    if "iPhone" in ua:
+        os_device = "iPhone (iOS)"
+    elif "iPad" in ua:
+        os_device = "iPad (iOS)"
+    elif "iPod" in ua:
+        os_device = "iPod (iOS)"
     elif "Android" in ua:
-        os_device = "Android (Mobile)" if "Mobile" in ua else "Android (Tablet)"
+        os_device = "Android"
     elif "Mac" in ua or "Macintosh" in ua:
         os_device = "Mac (macOS)"
     elif "Windows" in ua or "Win" in ua:
-        os_device = "PC (Windows)"
+        os_device = "Windows PC"
     elif "Linux" in ua:
-        os_device = "PC (Linux)"
+        os_device = "Linux"
     else:
         os_device = "Unknown"
-    # Browser
+    # Browser (порядок важен: Edge до Chrome, Yandex до Chrome)
     if "Edg/" in ua:
         browser = "Edge"
+    elif "YaBrowser/" in ua or "Yandex" in ua:
+        browser = "Yandex"
     elif "Chrome/" in ua and "Edg" not in ua:
         browser = "Chrome"
     elif "Firefox/" in ua:
@@ -751,7 +798,6 @@ async def web_widget_webhook(
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
-    thread_id_raw = body.get("thread_id")
     visitor_id = (body.get("client_id") or "").strip()
     browser = (body.get("browser") or "").strip()
     os_device = (body.get("os_device") or "").strip()
@@ -760,6 +806,52 @@ async def web_widget_webhook(
     if not browser and not os_device and user_agent:
         os_device, browser = _parse_user_agent(user_agent)
 
+    # IP и геолокация
+    client_ip = _get_client_ip(request)
+    location = ""
+    if client_ip:
+        location = await _fetch_geolocation(client_ip)
+
+    # ЖЕСТКОЕ ПРАВИЛО: сначала ищем клиента по axolotl_visitor_id, НЕ по id
+    client = None
+    if visitor_id:
+        result = await session.execute(
+            select(Client).where(Client.axolotl_visitor_id == visitor_id)
+        )
+        client = result.scalar_one_or_none()
+
+    if client is not None:
+        # Клиент найден — обновляем техданные, НЕ создаём нового
+        if client_ip:
+            client.ip = client_ip
+        if location:
+            client.location = location
+        if browser:
+            client.browser = browser
+        if os_device:
+            client.os_device = os_device
+        await session.flush()
+    else:
+        # Клиент НЕ найден — создаём нового и обязательно записываем axolotl_visitor_id
+        client = Client(
+            name="Посетитель сайта",
+            avatar="",
+            phone="",
+            email="",
+            website="",
+            notes="",
+            tags="web",
+            axolotl_visitor_id=visitor_id or "",
+            ip=client_ip or "",
+            location=location,
+            browser=browser,
+            os_device=os_device,
+        )
+        session.add(client)
+        await session.flush()
+
+    # Теперь ищем диалог для этого клиента
+    thread_id_raw = body.get("thread_id")
     conv = None
 
     if thread_id_raw:
@@ -775,38 +867,11 @@ async def web_widget_webhook(
             )
             conv = result.scalar_one_or_none()
 
+        # thread_id должен указывать на диалог нашего клиента, иначе — игнорируем
+        if conv is not None and conv.client_id != client.id:
+            conv = None
+
     if conv is None:
-        client = None
-        if visitor_id:
-            result = await session.execute(
-                select(Client).where(Client.axolotl_visitor_id == visitor_id)
-            )
-            client = result.scalar_one_or_none()
-
-        if client is None:
-            client = Client(
-                name="Посетитель сайта",
-                avatar="",
-                phone="",
-                email="",
-                website="",
-                notes="",
-                tags="web",
-                axolotl_visitor_id=visitor_id or "",
-                browser=browser,
-                os_device=os_device,
-            )
-            session.add(client)
-            await session.flush()
-        else:
-            if browser or os_device:
-                if browser:
-                    client.browser = browser
-                if os_device:
-                    client.os_device = os_device
-                await session.flush()
-
-        social_id = visitor_id or str(uuid.uuid4())
         result = await session.execute(
             select(Conversation).where(
                 Conversation.source == "web",
@@ -814,15 +879,17 @@ async def web_widget_webhook(
             )
         )
         conv = result.scalar_one_or_none()
-        if conv is None:
-            conv = Conversation(
-                client_id=client.id,
-                source="web",
-                social_id=social_id,
-                label="Web: Посетитель сайта",
-            )
-            session.add(conv)
-            await session.flush()
+
+    if conv is None:
+        social_id = visitor_id or str(uuid.uuid4())
+        conv = Conversation(
+            client_id=client.id,
+            source="web",
+            social_id=social_id,
+            label="Web: Посетитель сайта",
+        )
+        session.add(conv)
+        await session.flush()
 
     msg = Message(
         conversation_id=conv.id,
