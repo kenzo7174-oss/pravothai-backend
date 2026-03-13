@@ -39,6 +39,8 @@ from app.schemas import (
 from app.services.ai_dispatcher import (
     INTERCEPT_MODE_BOT,
     INTERCEPT_MODE_PROMPTER,
+    INTERCEPT_MODE_MANUAL,
+    INTERCEPT_MODE_SENIOR,
     process_incoming_client_message,
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
@@ -56,7 +58,7 @@ logging.basicConfig(
 class _SuppressPollingFilter(logging.Filter):
     """Drop INFO access-log records for the high-frequency polling endpoint."""
 
-    _NOISY_FRAGMENTS = ("GET /api/v1/clients ", "GET /api/v1/health ")
+    _NOISY_FRAGMENTS = ("GET /api/v1/clients ", "GET /api/v1/health ", "GET /api/v1/webhooks/web/")
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno > logging.INFO:
@@ -274,17 +276,24 @@ async def create_message(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
 
+    # Нормализация sender: support → operator для совместимости с виджетом и схемой
+    sender = body.sender
+    if sender in ("support", "operator"):
+        sender = "operator"
+    elif sender in ("assistant", "bot"):
+        sender = "bot"
+
     msg = Message(
         conversation_id=conversation_id,
         content=body.content,
-        sender=body.sender,
+        sender=sender,
         is_read=False,
     )
     session.add(msg)
     await session.commit()
     await session.refresh(msg)
 
-    if conv.source == "telegram" and conv.social_id and body.sender != "client":
+    if conv.source == "telegram" and conv.social_id and sender != "client":
         ok = await send_telegram_message(conv.social_id, body.content)
         if not ok:
             log.warning(
@@ -296,6 +305,21 @@ async def create_message(
     return msg
 
 
+def _normalize_intercept_mode(mode: str | None) -> str:
+    """Нормализует режим: full_control → manual, невалидные → bot."""
+    if not mode:
+        return INTERCEPT_MODE_BOT
+    normalized = mode.strip().lower()
+    if normalized == "full_control":
+        return INTERCEPT_MODE_MANUAL
+    if normalized in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER, INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        return normalized
+    return INTERCEPT_MODE_BOT
+
+
+SENIOR_NOTIFICATION_TEXT = "К диалогу подключился старший специалист."
+
+
 @app.patch("/api/v1/conversations/{conversation_id}/intercept-mode")
 async def update_intercept_mode(
     conversation_id: int,
@@ -303,15 +327,43 @@ async def update_intercept_mode(
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
-    """Обновляет серверный режим перехвата для диалога."""
+    """Обновляет серверный режим перехвата для диалога.
+
+    Поддерживает 4 режима: bot, prompter, manual, senior.
+    При переключении на senior — отправляет клиенту системное сообщение (БД + Telegram).
+    При переключении на manual — уведомлений нет (бесшовный перехват).
+    """
     conv = await session.get(Conversation, conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    conv.intercept_mode = body.mode or INTERCEPT_MODE_BOT
+    conv.intercept_mode = _normalize_intercept_mode(body.mode)
+
     if conv.intercept_mode != INTERCEPT_MODE_PROMPTER:
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
+
+    # При переключении на senior — отправляем уведомление клиенту
+    if conv.intercept_mode == INTERCEPT_MODE_SENIOR:
+        sys_msg = Message(
+            conversation_id=conv.id,
+            content=SENIOR_NOTIFICATION_TEXT,
+            sender="bot",
+            is_read=False,
+            is_voice=False,
+        )
+        session.add(sys_msg)
+        await session.flush()
+
+        if conv.source == "telegram" and conv.social_id:
+            ok = await send_telegram_message(conv.social_id, SENIOR_NOTIFICATION_TEXT)
+            if not ok:
+                log.warning(
+                    "Уведомление senior сохранено в БД, но не отправлено в Telegram (conv=%s)",
+                    conversation_id,
+                )
+
+    # manual — без уведомлений (бесшовный перехват)
 
     await session.commit()
 
@@ -496,6 +548,67 @@ async def telegram_webhook(
 #  API v1 — Web Widget Webhook
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+def _parse_thread_id_int(value) -> int | None:
+    """Безопасное извлечение integer из thread_id (например, 'conv-123' или '123')."""
+    if value is None:
+        return None
+    s = str(value).strip().replace("conv-", "").replace("conv_", "").strip()
+    if not s or not s.isdigit():
+        return None
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return None
+
+
+async def _resolve_web_conversation(session, thread_id_raw: str | None):
+    """Ищет Conversation по thread_id (conv-123 или social_id). Возвращает (conv, None) или (None, HTTPException)."""
+    if not thread_id_raw:
+        return None, HTTPException(status_code=400, detail="thread_id is required")
+    conv_id = _parse_thread_id_int(thread_id_raw)
+    conv = None
+    if conv_id is not None:
+        conv = await session.get(Conversation, conv_id)
+    if conv is None:
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.source == "web",
+                Conversation.social_id == str(thread_id_raw),
+            )
+        )
+        conv = result.scalar_one_or_none()
+    if conv is None:
+        return None, HTTPException(status_code=404, detail="Conversation not found")
+    return conv, None
+
+
+@app.get("/api/v1/webhooks/web/{thread_id}")
+async def web_widget_poll_messages(
+    thread_id: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """Поллинговый эндпоинт для веб-виджета: возвращает все сообщения диалога.
+
+    Используется для получения асинхронных сообщений от оператора и системных уведомлений.
+    Формат: [{"id": 1, "sender": "bot", "content": "..."}]
+    """
+    conv, err = await _resolve_web_conversation(session, thread_id)
+    if err is not None:
+        raise err
+
+    result = await session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+    )
+    messages = result.scalars().all()
+    return [
+        {"id": m.id, "sender": m.sender, "content": m.content}
+        for m in messages
+    ]
+
+
 @app.post("/api/v1/webhooks/web")
 async def web_widget_webhook(
     request: Request,
@@ -517,18 +630,6 @@ async def web_widget_webhook(
 
     thread_id_raw = body.get("thread_id")
     conv = None
-
-    def _parse_thread_id_int(value) -> int | None:
-        """Безопасное извлечение integer из thread_id (например, 'conv-123' или '123')."""
-        if value is None:
-            return None
-        s = str(value).strip().replace("conv-", "").replace("conv_", "").strip()
-        if not s or not s.isdigit():
-            return None
-        try:
-            return int(s)
-        except (ValueError, TypeError):
-            return None
 
     if thread_id_raw:
         conv_id = _parse_thread_id_int(thread_id_raw)
