@@ -414,7 +414,7 @@ async def update_intercept_mode(
         sys_msg = Message(
             conversation_id=conv.id,
             content=senior_text,
-            sender="bot",
+            sender="system",
             is_read=False,
             is_voice=False,
         )
@@ -422,7 +422,9 @@ async def update_intercept_mode(
         await session.flush()
 
         if conv.source == "telegram" and conv.social_id:
-            ok = await send_telegram_message(conv.social_id, senior_text)
+            # Визуально выделяем только эту отбивку: эмодзи + курсив (HTML)
+            formatted_text = f"👤 <i>{senior_text}</i>"
+            ok = await send_telegram_message(conv.social_id, formatted_text)
             if not ok:
                 log.warning(
                     "Уведомление senior сохранено в БД, но не отправлено в Telegram (conv=%s)",
