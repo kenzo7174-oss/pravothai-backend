@@ -107,8 +107,10 @@ def _extract_contacts_from_text(text: str) -> dict[str, str]:
             result["phone"] = ("+" + raw) if not raw.startswith("+") else raw
 
     # Соцсети и сайты: vk.com, t.me, instagram.com или личные домены (http/https)
+    # Negative lookbehind (?<![@\w.]) — не захватывать домены, являющиеся частью email
+    # (исключаем позиции сразу после @, букв и точек — т.е. внутри local@domain)
     social_pattern = (
-        r"(?:https?://)?(?:"
+        r"(?:https?://)?(?<![@\w.])(?:"
         r"(?:vk\.com/[\w.]+)|"
         r"(?:t\.me/[\w]+)|"
         r"(?:instagram\.com/[\w.]+)|"
