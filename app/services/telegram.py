@@ -49,12 +49,13 @@ async def get_telegram_webhook_info() -> dict | None:
     return await _telegram_api_post("getWebhookInfo", {})
 
 
-async def send_telegram_message(chat_id: str, text: str) -> bool:
+async def send_telegram_message(chat_id: str, text: str, parse_mode: str = "HTML") -> bool:
     """
     Отправляет текстовое сообщение в Telegram-чат.
     Возвращает True при успехе, False при ошибке.
+    parse_mode: "HTML" | "Markdown" | "MarkdownV2"
     """
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     return await _telegram_api_post("sendMessage", payload) is not None
 
 
