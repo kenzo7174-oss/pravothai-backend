@@ -47,7 +47,12 @@ class Client(Base):
     email: Mapped[str] = mapped_column(String(255), default="")
     location: Mapped[str] = mapped_column(String(255), default="")       # Город/Страна
     website: Mapped[str] = mapped_column(String(255), default="")        # Сайт/Соцсеть
-    device_info: Mapped[str] = mapped_column(String(255), default="")    # Данные системы
+    device_info: Mapped[str] = mapped_column(String(255), default="")    # Данные системы (legacy)
+
+    # 🟢 ВЕБ-ВИДЖЕТ: склейка клиентов и техданные
+    axolotl_visitor_id: Mapped[str] = mapped_column(String(64), index=True, default="")
+    browser: Mapped[str] = mapped_column(String(64), default="")
+    os_device: Mapped[str] = mapped_column(String(128), default="")
     
     notes: Mapped[str] = mapped_column(Text, default="")
     tags: Mapped[str] = mapped_column(String(500), default="")
