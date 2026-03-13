@@ -118,3 +118,24 @@ class Message(Base):
     is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SYSTEM SETTINGS — Singleton (всегда одна запись id=1)
+# ═══════════════════════════════════════════════════════════════════════════
+DEFAULT_SENIOR_WELCOME_MESSAGE = "К диалогу подключился старший специалист."
+
+
+class SystemSettings(Base):
+    """Системные настройки приложения. Singleton: всегда одна запись с id=1."""
+    __tablename__ = "system_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
+    senior_welcome_message: Mapped[str] = mapped_column(
+        String(500),
+        default=DEFAULT_SENIOR_WELCOME_MESSAGE,
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<SystemSettings id={self.id}>"
