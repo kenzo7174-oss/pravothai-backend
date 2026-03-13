@@ -13,7 +13,7 @@ import asyncio
 from datetime import datetime, timedelta
 
 from app.core.database import engine, AsyncSessionLocal, Base
-from app.models import Client, Conversation, Message
+from app.models import Client, Conversation, Message, SystemSettings, DEFAULT_SENIOR_WELCOME_MESSAGE
 
 
 # ── Вспомогательные временные метки ──────────────────────────────────────
@@ -249,7 +249,13 @@ async def seed_demo_data() -> None:
                 client.conversations = [entry["conv"]]
                 session.add(client)
 
-    print("✅ Демо-данные загружены: 5 клиентов, 7 диалогов, 17 сообщений.")
+            # Singleton системных настроек (id=1)
+            session.add(SystemSettings(
+                id=1,
+                senior_welcome_message=DEFAULT_SENIOR_WELCOME_MESSAGE,
+            ))
+
+    print("✅ Демо-данные загружены: 5 клиентов, 7 диалогов, 17 сообщений, системные настройки.")
 
 
 async def main() -> None:
