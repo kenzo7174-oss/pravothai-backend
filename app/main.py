@@ -1106,8 +1106,16 @@ async def merge_client(
 
     # Перепривязываем все диалоги source → target
     r = await session.execute(select(Conversation).where(Conversation.client_id == source.id))
-    for conv in r.scalars().all():
+    conversations = r.scalars().all()
+    for conv in conversations:
         conv.client_id = target.id
+
+    log.info(
+        "DEBUG MERGE: source=%s, target=%s, updated_chats=%s",
+        client_id,
+        body.target_client_id,
+        len(conversations),
+    )
 
     # Склеиваем заметки
     if source.notes and source.notes.strip():
