@@ -59,6 +59,16 @@ class InterceptModeUpdate(BaseModel):
     mode: str
 
 
+class SystemSettingsSchema(BaseModel):
+    """Системные настройки приложения."""
+    senior_welcome_message: str = "К диалогу подключился старший специалист."
+
+
+class SystemSettingsUpdate(BaseModel):
+    """Частичное обновление системных настроек."""
+    senior_welcome_message: Optional[str] = None
+
+
 class ClientUpdate(BaseModel):
     """Частичное обновление карточки клиента."""
     name: Optional[str] = None
