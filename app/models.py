@@ -85,7 +85,11 @@ class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False)
+    # Без ondelete="CASCADE" — при merge перепривязываем диалоги до удаления клиента
+    client_id: Mapped[int] = mapped_column(
+        ForeignKey("clients.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
 
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     social_id: Mapped[str] = mapped_column(String(120), default="")
