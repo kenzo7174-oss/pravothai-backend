@@ -124,6 +124,25 @@ async def ensure_conversation_runtime_columns() -> None:
                 f"ALTER TABLE messages ADD COLUMN is_voice BOOLEAN NOT NULL DEFAULT {default_val}"
             ))
 
+        # clients.notes (для заметок оператора)
+        client_columns = await _get_table_columns(conn, "clients")
+        if "notes" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN notes TEXT NOT NULL DEFAULT ''"
+            ))
+        if "axolotl_visitor_id" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN axolotl_visitor_id VARCHAR(64) NOT NULL DEFAULT ''"
+            ))
+        if "browser" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN browser VARCHAR(64) NOT NULL DEFAULT ''"
+            ))
+        if "os_device" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN os_device VARCHAR(128) NOT NULL DEFAULT ''"
+            ))
+
 
 async def register_telegram_webhook_on_startup() -> None:
     """Если заданы TELEGRAM_BOT_TOKEN и WEBHOOK_DOMAIN — регистрирует webhook в Telegram API."""
@@ -617,6 +636,42 @@ async def telegram_webhook(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
+def _parse_user_agent(ua: str | None) -> tuple[str, str]:
+    """Парсит userAgent в (os_device, browser). Возвращает понятные строки."""
+    if not ua or not isinstance(ua, str):
+        return ("", "")
+    ua = ua.strip()
+    os_device = ""
+    browser = ""
+    # OS/Device
+    if "iPhone" in ua or "iPad" in ua or "iPod" in ua:
+        os_device = "iPhone (iOS)" if "iPad" not in ua else "iPad (iOS)"
+    elif "Android" in ua:
+        os_device = "Android (Mobile)" if "Mobile" in ua else "Android (Tablet)"
+    elif "Mac" in ua or "Macintosh" in ua:
+        os_device = "Mac (macOS)"
+    elif "Windows" in ua or "Win" in ua:
+        os_device = "PC (Windows)"
+    elif "Linux" in ua:
+        os_device = "PC (Linux)"
+    else:
+        os_device = "Unknown"
+    # Browser
+    if "Edg/" in ua:
+        browser = "Edge"
+    elif "Chrome/" in ua and "Edg" not in ua:
+        browser = "Chrome"
+    elif "Firefox/" in ua:
+        browser = "Firefox"
+    elif "Safari/" in ua and "Chrome" not in ua:
+        browser = "Safari"
+    elif "Opera" in ua or "OPR/" in ua:
+        browser = "Opera"
+    else:
+        browser = "Other"
+    return (os_device, browser)
+
+
 def _parse_thread_id_int(value) -> int | None:
     """Безопасное извлечение integer из thread_id (например, 'conv-123' или '123')."""
     if value is None:
@@ -697,6 +752,14 @@ async def web_widget_webhook(
         raise HTTPException(status_code=400, detail="message is required")
 
     thread_id_raw = body.get("thread_id")
+    visitor_id = (body.get("client_id") or "").strip()
+    browser = (body.get("browser") or "").strip()
+    os_device = (body.get("os_device") or "").strip()
+    user_agent = body.get("user_agent") or body.get("userAgent") or ""
+
+    if not browser and not os_device and user_agent:
+        os_device, browser = _parse_user_agent(user_agent)
+
     conv = None
 
     if thread_id_raw:
@@ -713,27 +776,53 @@ async def web_widget_webhook(
             conv = result.scalar_one_or_none()
 
     if conv is None:
-        client = Client(
-            name="Посетитель сайта",
-            avatar="",
-            phone="",
-            email="",
-            website="",
-            notes="",
-            tags="web",
-        )
-        session.add(client)
-        await session.flush()
+        client = None
+        if visitor_id:
+            result = await session.execute(
+                select(Client).where(Client.axolotl_visitor_id == visitor_id)
+            )
+            client = result.scalar_one_or_none()
 
-        session_id = str(uuid.uuid4())
-        conv = Conversation(
-            client_id=client.id,
-            source="web",
-            social_id=session_id,
-            label="Web: Посетитель сайта",
+        if client is None:
+            client = Client(
+                name="Посетитель сайта",
+                avatar="",
+                phone="",
+                email="",
+                website="",
+                notes="",
+                tags="web",
+                axolotl_visitor_id=visitor_id or "",
+                browser=browser,
+                os_device=os_device,
+            )
+            session.add(client)
+            await session.flush()
+        else:
+            if browser or os_device:
+                if browser:
+                    client.browser = browser
+                if os_device:
+                    client.os_device = os_device
+                await session.flush()
+
+        social_id = visitor_id or str(uuid.uuid4())
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.source == "web",
+                Conversation.client_id == client.id,
+            )
         )
-        session.add(conv)
-        await session.flush()
+        conv = result.scalar_one_or_none()
+        if conv is None:
+            conv = Conversation(
+                client_id=client.id,
+                source="web",
+                social_id=social_id,
+                label="Web: Посетитель сайта",
+            )
+            session.add(conv)
+            await session.flush()
 
     msg = Message(
         conversation_id=conv.id,
