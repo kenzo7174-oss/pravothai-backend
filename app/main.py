@@ -351,6 +351,18 @@ async def healthcheck():
     return {"ok": True, "status": "online"}
 
 
+@app.get("/api/v1/fix-db")
+async def fix_db_migration(session: AsyncSession = Depends(get_session)):
+    """Временный эндпоинт для миграции: добавление колонки is_internal в messages.
+    Вызовите GET /api/v1/fix-db на сервере Render, затем удалите этот эндпоинт."""
+    try:
+        await session.execute(text("ALTER TABLE messages ADD COLUMN is_internal BOOLEAN DEFAULT FALSE;"))
+        await session.commit()
+        return {"status": "success", "message": "Column added!"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  API v1 — Аутентификация
 # ═══════════════════════════════════════════════════════════════════════════
