@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
@@ -598,16 +598,43 @@ async def update_intercept_mode(
     Поддерживает 4 режима: bot, prompter, manual, senior.
     При переключении на senior — отправляет клиенту системное сообщение (БД + Telegram).
     При переключении на manual — уведомлений нет (бесшовный перехват).
+    При перехвате (bot -> manual/prompter/senior) создаёт скрытое системное сообщение (is_internal).
     """
     conv = await session.get(Conversation, conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    conv.intercept_mode = _normalize_intercept_mode(body.mode)
+    prev_mode = conv.intercept_mode or INTERCEPT_MODE_BOT
+    new_mode = _normalize_intercept_mode(body.mode)
+    conv.intercept_mode = new_mode
 
     if conv.intercept_mode != INTERCEPT_MODE_PROMPTER:
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
+
+    # Скрытое системное сообщение при перехвате (видны только в Терминале)
+    if prev_mode == INTERCEPT_MODE_BOT and new_mode in {
+        INTERCEPT_MODE_PROMPTER,
+        INTERCEPT_MODE_MANUAL,
+        INTERCEPT_MODE_SENIOR,
+    }:
+        device_id = (body.device_id or "").strip() or "—"
+        operator_name = (body.operator_name or "").strip() or "Оператор"
+        operator_role = (body.operator_role or "").strip() or "Специалист"
+        internal_text = (
+            f"Оператор {operator_name} ({operator_role}, ID: {device_id}) "
+            f"перехватил управление. Режим: {new_mode}"
+        )
+        internal_msg = Message(
+            conversation_id=conv.id,
+            content=internal_text,
+            sender="system",
+            is_read=False,
+            is_voice=False,
+            is_internal=True,
+        )
+        session.add(internal_msg)
+        await session.flush()
 
     # При переключении на senior — отправляем уведомление клиенту (из SystemSettings)
     if conv.intercept_mode == INTERCEPT_MODE_SENIOR:
@@ -962,7 +989,10 @@ async def web_widget_poll_messages(
 
     result = await session.execute(
         select(Message)
-        .where(Message.conversation_id == conv.id)
+        .where(
+            Message.conversation_id == conv.id,
+            or_(Message.is_internal == False, Message.is_internal.is_(None)),
+        )
         .order_by(Message.created_at.asc())
     )
     messages = result.scalars().all()
