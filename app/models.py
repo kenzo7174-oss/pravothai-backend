@@ -127,6 +127,7 @@ class Message(Base):
     )
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
