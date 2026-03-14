@@ -330,9 +330,9 @@ app.include_router(ai_endpoints.router, prefix="/api/v1")
 # ── CORS ──────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r".*",
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -349,18 +349,6 @@ async def root():
 @app.get("/api/v1/health")
 async def healthcheck():
     return {"ok": True, "status": "online"}
-
-
-@app.get("/api/v1/fix-db")
-async def fix_db_migration(session: AsyncSession = Depends(get_session)):
-    """Временный эндпоинт для миграции: добавление колонки is_internal в messages.
-    Вызовите GET /api/v1/fix-db на сервере Render, затем удалите этот эндпоинт."""
-    try:
-        await session.execute(text("ALTER TABLE messages ADD COLUMN is_internal BOOLEAN DEFAULT FALSE;"))
-        await session.commit()
-        return {"status": "success", "message": "Column added!"}
-    except Exception as e:
-        return {"status": "error", "detail": str(e)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
