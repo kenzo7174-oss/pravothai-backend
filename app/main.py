@@ -323,18 +323,20 @@ app = FastAPI(
     version="0.2.0",
     description="Омниканальная CRM для поддержки клиентов",
     lifespan=lifespan,
+    strict_slashes=False,
 )
 
-app.include_router(ai_endpoints.router, prefix="/api/v1")
-
-# ── CORS ──────────────────────────────────────────────────────────────────
+# ── CORS (сразу после app, выше маршрутов) ─────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+app.include_router(ai_endpoints.router, prefix="/api/v1")
 
 # ── Корневой эндпоинт ────────────────────────────────────────────────────
 @app.get("/")
@@ -737,7 +739,8 @@ async def telegram_webhook(
 
     try:
         update = await request.json()
-    except Exception:
+    except Exception as e:
+        print(f"ERROR telegram_webhook JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     tg_message = update.get("message") or update.get("edited_message")
@@ -1045,7 +1048,8 @@ async def web_widget_webhook(
     """
     try:
         body = await request.json()
-    except Exception:
+    except Exception as e:
+        print(f"ERROR web_widget_webhook JSON: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     text = (body.get("message") or "").strip()
