@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import or_, select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
@@ -542,11 +542,15 @@ async def _check_and_auto_wakeup_manual_mode(
     if conv.intercept_mode not in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
         return False
 
+    # Ищем последнее сообщение: от оператора ИЛИ внутреннее системное (перехват)
     result = await session.execute(
         select(Message)
         .where(
             Message.conversation_id == conv.id,
-            Message.sender == "operator",
+            or_(
+                Message.sender == "operator",
+                and_(Message.sender == "system", Message.is_internal == True),
+            ),
         )
         .order_by(Message.created_at.desc())
         .limit(1)
@@ -973,15 +977,27 @@ async def _resolve_web_conversation(session, thread_id_raw: str | None):
     return conv, None
 
 
+def _parse_operator_from_internal_message(text: str) -> dict | None:
+    """Извлекает имя и должность из текста внутреннего сообщения перехвата.
+
+    Формат: "Оператор {name} ({role}, ID: ...) перехватил управление. Режим: ..."
+    """
+    if not text or not isinstance(text, str):
+        return None
+    m = re.match(r"Оператор (.+?) \((.+?), ID:", text)
+    if m:
+        return {"name": m.group(1).strip(), "role": m.group(2).strip()}
+    return None
+
+
 @app.get("/api/v1/webhooks/web/{thread_id}")
 async def web_widget_poll_messages(
     thread_id: str,
     session: AsyncSession = Depends(get_session),
 ):
-    """Поллинговый эндпоинт для веб-виджета: возвращает все сообщения диалога.
+    """Поллинговый эндпоинт для веб-виджета: возвращает сообщения и данные оператора.
 
-    Используется для получения асинхронных сообщений от оператора и системных уведомлений.
-    Формат: [{"id": 1, "sender": "bot", "content": "..."}]
+    Формат: {"messages": [...], "current_operator": {"name": "...", "role": "..."} | null}
     """
     conv, err = await _resolve_web_conversation(session, thread_id)
     if err is not None:
@@ -996,10 +1012,25 @@ async def web_widget_poll_messages(
         .order_by(Message.created_at.asc())
     )
     messages = result.scalars().all()
-    return [
-        {"id": m.id, "sender": m.sender, "content": m.content}
-        for m in messages
-    ]
+    messages_data = [{"id": m.id, "sender": m.sender, "content": m.content} for m in messages]
+
+    current_operator = None
+    if conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        internal_result = await session.execute(
+            select(Message)
+            .where(
+                Message.conversation_id == conv.id,
+                Message.sender == "system",
+                Message.is_internal == True,
+            )
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        last_internal = internal_result.scalar_one_or_none()
+        if last_internal and last_internal.content:
+            current_operator = _parse_operator_from_internal_message(last_internal.content)
+
+    return {"messages": messages_data, "current_operator": current_operator}
 
 
 @app.post("/api/v1/webhooks/web")
