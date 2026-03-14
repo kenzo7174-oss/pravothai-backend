@@ -35,10 +35,11 @@ class MessageSchema(BaseModel):
 
     id: int
     content: str
-    sender: str          # client / bot / operator
+    sender: str          # client / bot / operator / system
     created_at: datetime
     is_read: bool
     is_voice: bool = False
+    is_internal: bool = False
 
 
 class ConversationSchema(BaseModel):
@@ -57,6 +58,9 @@ class ConversationSchema(BaseModel):
 class InterceptModeUpdate(BaseModel):
     """Обновление серверного режима перехвата."""
     mode: str
+    device_id: Optional[str] = None
+    operator_name: Optional[str] = None
+    operator_role: Optional[str] = None
 
 
 class SystemSettingsSchema(BaseModel):
