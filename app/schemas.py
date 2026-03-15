@@ -54,7 +54,13 @@ class ConversationSchema(BaseModel):
     specialist_requested: bool = False
     specialist_requested_at: Optional[datetime] = None
     pending_draft: Optional[str] = ""
+    tags: Optional[str] = ""
     messages: list[MessageSchema] = []
+
+
+class ConversationUpdate(BaseModel):
+    """Частичное обновление диалога."""
+    tags: Optional[str] = None
 
 
 class InterceptModeUpdate(BaseModel):
@@ -68,11 +74,19 @@ class InterceptModeUpdate(BaseModel):
 class SystemSettingsSchema(BaseModel):
     """Системные настройки приложения."""
     senior_welcome_message: str = "К диалогу подключился старший специалист."
+    business_hours_enabled: bool = False
+    business_start: str = "09:00"
+    business_end: str = "18:00"
+    operator_sla_minutes: int = 5
 
 
 class SystemSettingsUpdate(BaseModel):
     """Частичное обновление системных настроек."""
     senior_welcome_message: Optional[str] = None
+    business_hours_enabled: Optional[bool] = None
+    business_start: Optional[str] = None
+    business_end: Optional[str] = None
+    operator_sla_minutes: Optional[int] = None
 
 
 class ClientMergeRequest(BaseModel):
