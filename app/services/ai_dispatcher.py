@@ -102,16 +102,19 @@ async def process_incoming_client_message(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
-        await session.commit()
-        if request_operator:
-            await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
-        await session.refresh(ai_message)
-
-        if conv.source == "telegram" and conv.social_id:
-            ok = await send_telegram_message(conv.social_id, draft)
-            if not ok:
-                log.warning(
-                    "ИИ-ответ сохранён, но не отправлен в Telegram (conv=%s, social_id=%s)",
-                    conversation_id,
-                    conv.social_id,
-                )
+        try:
+            await session.commit()
+            await session.refresh(ai_message)
+            if conv.source == "telegram" and conv.social_id:
+                ok = await send_telegram_message(conv.social_id, draft)
+                if not ok:
+                    log.warning(
+                        "ИИ-ответ сохранён, но не отправлен в Telegram (conv=%s, social_id=%s)",
+                        conversation_id,
+                        conv.social_id,
+                    )
+        except Exception as e:
+            log.error("Ошибка диспетчера: %s", e)
+        finally:
+            if request_operator:
+                await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
