@@ -547,18 +547,18 @@ async def create_message(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    if body.sender != "client":
-        conv.pending_draft = ""
-        conv.pending_draft_message_id = None
-        # Оператор ответил — сбрасываем флаг запроса специалиста
-        conv.specialist_requested = False
-
     # Нормализация sender: support → operator для совместимости с виджетом и схемой
     sender = body.sender
     if sender in ("support", "operator"):
         sender = "operator"
     elif sender in ("assistant", "bot"):
         sender = "bot"
+
+    # Сброс pending_draft и specialist_requested ТОЛЬКО при ответе оператора (не bot/assistant/system)
+    if sender == "operator":
+        conv.pending_draft = ""
+        conv.pending_draft_message_id = None
+        conv.specialist_requested = False
 
     msg = Message(
         conversation_id=conversation_id,
@@ -584,7 +584,7 @@ async def create_message(
 
 # Ключевые слова для определения запроса клиентом специалиста
 _SPECIALIST_REQUEST_PATTERNS = re.compile(
-    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|хочу\s+поговорить|соедините|позовите|позвать)\b",
+    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|хочу\s+поговорить|соедините|позовите|позвать|поддержка|саппорт|админ|admin|техподдержка|свяжите)\b",
     re.IGNORECASE,
 )
 
