@@ -339,6 +339,8 @@ app = FastAPI(
 )
 
 # ── CORS (сразу после app, выше маршрутов) ─────────────────────────────────
+# Разрешаем фронтенд (localhost:5173 Vite, localhost:3000) и SSE. allow_credentials=False
+# требуется при allow_origins=["*"] по спецификации CORS.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
