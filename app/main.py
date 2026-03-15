@@ -245,6 +245,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 f"ALTER TABLE conversations ADD COLUMN specialist_requested BOOLEAN NOT NULL DEFAULT {default_val}"
             ))
+        if "specialist_requested_at" not in existing_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN specialist_requested_at TIMESTAMP"
+            ))
 
         msg_columns = await _get_table_columns(conn, "messages")
 
@@ -1232,6 +1236,7 @@ async def web_widget_webhook(
 
     if request_operator:
         conv.specialist_requested = True
+        conv.specialist_requested_at = datetime.utcnow()
 
     if draft:
         ai_msg = Message(
@@ -1242,6 +1247,15 @@ async def web_widget_webhook(
             is_voice=False,
         )
         session.add(ai_msg)
+        if request_operator:
+            system_msg = Message(
+                conversation_id=conv.id,
+                content="Перевожу диалог на специалиста, пожалуйста, ожидайте.",
+                sender="system",
+                is_read=False,
+                is_voice=False,
+            )
+            session.add(system_msg)
         await session.commit()
         await session.refresh(ai_msg)
     elif request_operator:
