@@ -103,10 +103,9 @@ async def process_incoming_client_message(
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
         await session.commit()
-        await session.refresh(ai_message)
-
         if request_operator:
             await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
+        await session.refresh(ai_message)
 
         if conv.source == "telegram" and conv.social_id:
             ok = await send_telegram_message(conv.social_id, draft)
