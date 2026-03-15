@@ -52,6 +52,7 @@ class ConversationSchema(BaseModel):
     label: str
     intercept_mode: str = "bot"
     specialist_requested: bool = False
+    specialist_requested_at: Optional[datetime] = None
     pending_draft: Optional[str] = ""
     messages: list[MessageSchema] = []
 
