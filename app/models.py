@@ -100,6 +100,7 @@ class Conversation(Base):
     pending_draft: Mapped[str] = mapped_column(Text, default="")
     pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tags: Mapped[str] = mapped_column(String(500), default="")
 
     messages: Mapped[List["Message"]] = relationship(
         back_populates="conversation",
@@ -150,6 +151,10 @@ class SystemSettings(Base):
         default=DEFAULT_SENIOR_WELCOME_MESSAGE,
         nullable=False,
     )
+    business_hours_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    business_start: Mapped[str] = mapped_column(String(10), default="09:00")
+    business_end: Mapped[str] = mapped_column(String(10), default="18:00")
+    operator_sla_minutes: Mapped[int] = mapped_column(Integer, default=5)
 
     def __repr__(self) -> str:
         return f"<SystemSettings id={self.id}>"
