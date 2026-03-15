@@ -95,6 +95,7 @@ class Conversation(Base):
     social_id: Mapped[str] = mapped_column(String(120), default="")
     label: Mapped[str] = mapped_column(String(255), default="")
     intercept_mode: Mapped[str] = mapped_column(String(30), default="bot")
+    specialist_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     pending_draft: Mapped[str] = mapped_column(Text, default="")
     pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
