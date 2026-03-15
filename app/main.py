@@ -6,6 +6,7 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
     python -m app.main
 """
 
+import asyncio
 import logging
 import re
 import uuid
@@ -13,7 +14,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import selectinload
@@ -58,6 +59,8 @@ from app.services.ai_dispatcher import (
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
 from app.services.openai_service import generate_draft, transcribe_voice
 from app.api.endpoints import ai as ai_endpoints
+from app.core.sse import sse_manager
+from jose import JWTError, jwt
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +73,7 @@ logging.basicConfig(
 class _SuppressPollingFilter(logging.Filter):
     """Drop INFO access-log records for the high-frequency polling endpoint."""
 
-    _NOISY_FRAGMENTS = ("GET /api/v1/clients ", "GET /api/v1/health ", "GET /api/v1/webhooks/web/")
+    _NOISY_FRAGMENTS = ("GET /api/v1/clients ", "GET /api/v1/health ", "GET /api/v1/webhooks/web/", "GET /api/v1/events/stream")
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno > logging.INFO:
@@ -360,6 +363,54 @@ async def root():
 @app.get("/api/v1/health")
 async def healthcheck():
     return {"ok": True, "status": "online"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  API v1 — SSE (мгновенные обновления при specialist_requested)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _verify_sse_token(token: str | None = Query(None, alias="token")) -> None:
+    """Проверяет JWT из query-параметра (EventSource не поддерживает заголовки)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Token required")
+    try:
+        jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+
+@app.get("/api/v1/events/stream")
+async def sse_stream(
+    _: None = Depends(_verify_sse_token),
+):
+    """SSE-поток для мгновенных уведомлений (chat_updated при specialist_requested)."""
+    from fastapi.responses import StreamingResponse
+
+    async def event_generator():
+        queue = sse_manager.add_client()
+        try:
+            yield "data: {\"event\":\"connected\"}\n\n"
+            while True:
+                msg = await queue.get()
+                yield f"data: {msg}\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sse_manager.remove_client(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1260,6 +1311,9 @@ async def web_widget_webhook(
         await session.refresh(ai_msg)
     elif request_operator:
         await session.commit()
+
+    if request_operator:
+        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
 
     return {
         "reply": draft or "Извините, не удалось сформировать ответ. Попробуйте позже.",
