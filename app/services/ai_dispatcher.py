@@ -61,7 +61,7 @@ async def process_incoming_client_message(
         if not recent_messages:
             return
 
-        draft, request_operator = await generate_draft(recent_messages)
+        draft, request_operator = await generate_draft(recent_messages, session=session)
         if not draft:
             log.warning(
                 "Не удалось сгенерировать ИИ-ответ для conversation_id=%s, mode=%s",
