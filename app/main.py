@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
 
 from app.core.config import settings
-from app.core.database import engine, get_session, is_postgres, Base
+from app.core.database import engine, get_session, is_postgres, Base, AsyncSessionLocal
 from app.core.auth import (
     hash_password,
     verify_password,
@@ -41,6 +41,7 @@ from app.schemas import (
     ClientMergeRequest,
     ClientSchema,
     ClientUpdate,
+    ConversationUpdate,
     InterceptModeUpdate,
     LoginRequest,
     MessageCreate,
@@ -252,6 +253,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE conversations ADD COLUMN specialist_requested_at TIMESTAMP"
             ))
+        if "tags" not in existing_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN tags VARCHAR(500) NOT NULL DEFAULT ''"
+            ))
 
         msg_columns = await _get_table_columns(conn, "messages")
 
@@ -287,6 +292,105 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE clients ADD COLUMN social_link VARCHAR(500) NOT NULL DEFAULT ''"
             ))
+
+        # system_settings (рабочие часы, SLA)
+        ss_columns = await _get_table_columns(conn, "system_settings")
+        if "business_hours_enabled" not in ss_columns:
+            default_bool = "0" if not is_postgres() else "false"
+            await conn.execute(text(
+                f"ALTER TABLE system_settings ADD COLUMN business_hours_enabled BOOLEAN NOT NULL DEFAULT {default_bool}"
+            ))
+        if "business_start" not in ss_columns:
+            await conn.execute(text(
+                "ALTER TABLE system_settings ADD COLUMN business_start VARCHAR(10) NOT NULL DEFAULT '09:00'"
+            ))
+        if "business_end" not in ss_columns:
+            await conn.execute(text(
+                "ALTER TABLE system_settings ADD COLUMN business_end VARCHAR(10) NOT NULL DEFAULT '18:00'"
+            ))
+        if "operator_sla_minutes" not in ss_columns:
+            await conn.execute(text(
+                "ALTER TABLE system_settings ADD COLUMN operator_sla_minutes INTEGER NOT NULL DEFAULT 5"
+            ))
+
+
+async def sla_monitor_loop() -> None:
+    """Фоновый монитор: автовозврат ИИ при SLA-таймауте (оператор не ответил)."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+                sys_settings = result.scalar_one_or_none()
+                sla_minutes = getattr(sys_settings, "operator_sla_minutes", 5) if sys_settings else 5
+                sla_minutes = max(1, min(60, int(sla_minutes)))
+
+                now = datetime.now(timezone.utc)
+                cutoff_naive = (now - timedelta(minutes=sla_minutes)).replace(tzinfo=None)
+
+                r = await session.execute(
+                    select(Conversation)
+                    .where(
+                        Conversation.specialist_requested == True,
+                        Conversation.specialist_requested_at.isnot(None),
+                        Conversation.specialist_requested_at < cutoff_naive,
+                    )
+                )
+                timed_out_convs = list(r.scalars().all())
+
+                for conv in timed_out_convs:
+                    try:
+                        conv.specialist_requested = False
+                        conv.intercept_mode = INTERCEPT_MODE_BOT
+                        conv.pending_draft = ""
+                        conv.pending_draft_message_id = None
+
+                        internal_msg = Message(
+                            conversation_id=conv.id,
+                            content="Сработал автовозврат ИИ: таймаут ожидания оператора.",
+                            sender="system",
+                            is_read=False,
+                            is_voice=False,
+                            is_internal=True,
+                        )
+                        session.add(internal_msg)
+                        await session.flush()
+
+                        msg_result = await session.execute(
+                            select(Message)
+                            .where(Message.conversation_id == conv.id)
+                            .order_by(Message.created_at.desc())
+                            .limit(10)
+                        )
+                        recent = list(reversed(msg_result.scalars().all()))
+
+                        override = "Оператор не смог подойти к чату. Сильно извинись перед клиентом и постарайся помочь ему самостоятельно."
+                        draft, _ = await generate_draft(recent, session=session, override_instructions=override)
+
+                        if draft:
+                            ai_msg = Message(
+                                conversation_id=conv.id,
+                                content=draft,
+                                sender="assistant",
+                                is_read=False,
+                            )
+                            session.add(ai_msg)
+                            await session.commit()
+                            await session.refresh(ai_msg)
+
+                            if conv.source == "telegram" and conv.social_id:
+                                await send_telegram_message(conv.social_id, draft)
+
+                            await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+                            log.info("SLA автовозврат: conv_id=%s", conv.id)
+                        else:
+                            await session.commit()
+                            await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+                    except Exception as e:
+                        log.error("SLA monitor error for conv %s: %s", conv.id, e)
+                        await session.rollback()
+        except Exception as e:
+            log.error("SLA monitor loop error: %s", e)
 
 
 async def register_telegram_webhook_on_startup() -> None:
@@ -325,8 +429,14 @@ async def lifespan(app: FastAPI):
     await ensure_conversation_runtime_columns()
     await seed_default_operator()
     await register_telegram_webhook_on_startup()
+    sla_task = asyncio.create_task(sla_monitor_loop())
     log.info("FastAPI startup complete")
     yield
+    sla_task.cancel()
+    try:
+        await sla_task
+    except asyncio.CancelledError:
+        pass
 
 
 # ── FastAPI приложение ────────────────────────────────────────────────────
@@ -462,6 +572,10 @@ async def get_settings(
         await session.refresh(settings)
     return SystemSettingsSchema(
         senior_welcome_message=settings.senior_welcome_message,
+        business_hours_enabled=getattr(settings, "business_hours_enabled", False),
+        business_start=getattr(settings, "business_start", "09:00"),
+        business_end=getattr(settings, "business_end", "18:00"),
+        operator_sla_minutes=getattr(settings, "operator_sla_minutes", 5),
     )
 
 
@@ -483,10 +597,22 @@ async def patch_settings(
         await session.flush()
     if body.senior_welcome_message is not None:
         settings.senior_welcome_message = body.senior_welcome_message
+    if body.business_hours_enabled is not None:
+        settings.business_hours_enabled = body.business_hours_enabled
+    if body.business_start is not None:
+        settings.business_start = body.business_start
+    if body.business_end is not None:
+        settings.business_end = body.business_end
+    if body.operator_sla_minutes is not None:
+        settings.operator_sla_minutes = body.operator_sla_minutes
     await session.commit()
     await session.refresh(settings)
     return SystemSettingsSchema(
         senior_welcome_message=settings.senior_welcome_message,
+        business_hours_enabled=getattr(settings, "business_hours_enabled", False),
+        business_start=getattr(settings, "business_start", "09:00"),
+        business_end=getattr(settings, "business_end", "18:00"),
+        operator_sla_minutes=getattr(settings, "operator_sla_minutes", 5),
     )
 
 
@@ -670,6 +796,24 @@ async def _get_senior_welcome_message(session: AsyncSession) -> str:
     return DEFAULT_SENIOR_WELCOME_MESSAGE
 
 
+@app.patch("/api/v1/conversations/{conversation_id}")
+async def update_conversation(
+    conversation_id: int,
+    body: ConversationUpdate,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Частичное обновление диалога (теги и др.)."""
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if body.tags is not None:
+        conv.tags = body.tags
+    await session.commit()
+    await session.refresh(conv)
+    return {"id": conv.id, "tags": conv.tags}
+
+
 @app.patch("/api/v1/conversations/{conversation_id}/intercept-mode")
 async def update_intercept_mode(
     conversation_id: int,
@@ -786,7 +930,7 @@ async def generate_draft_endpoint(
     if not recent:
         raise HTTPException(status_code=400, detail="No messages in conversation")
 
-    draft, request_operator = await generate_draft(recent)
+    draft, request_operator = await generate_draft(recent, session=session)
     if draft is None:
         raise HTTPException(status_code=502, detail="Failed to generate draft")
 
@@ -1285,7 +1429,7 @@ async def web_widget_webhook(
         .limit(10)
     )
     recent = list(reversed(result.scalars().all()))
-    draft, request_operator = await generate_draft(recent)
+    draft, request_operator = await generate_draft(recent, session=session)
 
     if request_operator:
         conv.specialist_requested = True
