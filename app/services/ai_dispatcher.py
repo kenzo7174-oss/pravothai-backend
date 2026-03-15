@@ -12,6 +12,7 @@ from datetime import datetime
 from sqlalchemy import select
 
 from app.core.database import AsyncSessionLocal
+from app.core.sse import sse_manager
 from app.models import Conversation, Message
 from app.services.openai_service import generate_draft
 from app.services.telegram import send_telegram_message
@@ -78,6 +79,8 @@ async def process_incoming_client_message(
             conv.pending_draft_message_id = message_id
             conv.last_ai_handled_message_id = message_id
             await session.commit()
+            if request_operator:
+                await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
             return
 
         ai_message = Message(
@@ -100,6 +103,9 @@ async def process_incoming_client_message(
         conv.last_ai_handled_message_id = message_id
         await session.commit()
         await session.refresh(ai_message)
+
+        if request_operator:
+            await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
 
         if conv.source == "telegram" and conv.social_id:
             ok = await send_telegram_message(conv.social_id, draft)
