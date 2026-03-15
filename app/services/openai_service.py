@@ -7,13 +7,21 @@
 
 import io
 import logging
+from datetime import datetime
+from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI, APIError
+from sqlalchemy import select
 
 from app.core.config import settings
-from app.models import Message
+from app.models import Message, SystemSettings
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+OFF_HOURS_INSTRUCTION = """CRITICAL: Сейчас нерабочее время поддержки. Операторов нет. ЗАПРЕЩЕНО вызывать request_human_operator. Извинись перед клиентом, сообщи рабочие часы и попытайся решить вопрос самостоятельно."""
 
 # Инструкции для модели. База знаний настраивается в промпте OPENAI_RESPONSE_ID.
 TECHNICAL_INSTRUCTIONS = """Ты — ассистент поддержки. Отвечай на основе базы знаний из промпта.
@@ -96,11 +104,50 @@ def _parse_response_output(response) -> tuple[str | None, bool]:
     return message_text, request_operator
 
 
-async def generate_draft(messages: list[Message]) -> tuple[str | None, bool]:
+def _parse_time(s: str) -> tuple[int, int] | None:
+    """Парсит 'HH:MM' в (час, минута)."""
+    if not s or not isinstance(s, str):
+        return None
+    parts = s.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        h, m = int(parts[0]), int(parts[1])
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return (h, m)
+    except ValueError:
+        pass
+    return None
+
+
+def _is_within_business_hours(
+    business_start: str,
+    business_end: str,
+) -> bool:
+    """Проверяет, попадает ли текущее время сервера в интервал business_start - business_end."""
+    start_t = _parse_time(business_start)
+    end_t = _parse_time(business_end)
+    if not start_t or not end_t:
+        return True
+    now = datetime.now()
+    current_minutes = now.hour * 60 + now.minute
+    start_minutes = start_t[0] * 60 + start_t[1]
+    end_minutes = end_t[0] * 60 + end_t[1]
+    if start_minutes <= end_minutes:
+        return start_minutes <= current_minutes <= end_minutes
+    return current_minutes >= start_minutes or current_minutes <= end_minutes
+
+
+async def generate_draft(
+    messages: list[Message],
+    session: "AsyncSession | None" = None,
+    override_instructions: str | None = None,
+) -> tuple[str | None, bool]:
     """Генерирует черновик ответа на основе истории диалога через OpenAI Responses API.
 
     Принимает последние N ORM-объектов Message,
     возвращает (текст сообщения, request_operator) или (None, False) при ошибке.
+    override_instructions: при задании подменяет инструкции и отключает request_human_operator.
     """
     api_key = settings.OPENAI_API_KEY
     prompt_id = settings.OPENAI_RESPONSE_ID
@@ -116,11 +163,26 @@ async def generate_draft(messages: list[Message]) -> tuple[str | None, bool]:
         for msg in messages
     ]
 
+    instructions = TECHNICAL_INSTRUCTIONS
+    tools = [REQUEST_HUMAN_OPERATOR_TOOL]
+
+    if override_instructions:
+        instructions = override_instructions
+        tools = []
+    elif session:
+        result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+        sys_settings = result.scalar_one_or_none()
+        if sys_settings and getattr(sys_settings, "business_hours_enabled", False):
+            start = getattr(sys_settings, "business_start", "09:00") or "09:00"
+            end = getattr(sys_settings, "business_end", "18:00") or "18:00"
+            if not _is_within_business_hours(start, end):
+                instructions = TECHNICAL_INSTRUCTIONS + "\n\n" + OFF_HOURS_INSTRUCTION
+
     create_params: dict = {
         "prompt": {"id": prompt_id},
-        "instructions": TECHNICAL_INSTRUCTIONS,
+        "instructions": instructions,
         "input": input_items,
-        "tools": [REQUEST_HUMAN_OPERATOR_TOOL],
+        "tools": tools,
         "store": False,
     }
 
@@ -129,6 +191,8 @@ async def generate_draft(messages: list[Message]) -> tuple[str | None, bool]:
         response = await client.responses.create(**create_params)
 
         message_text, request_operator = _parse_response_output(response)
+        if not tools:
+            request_operator = False
         return message_text, request_operator
 
     except APIError as exc:
