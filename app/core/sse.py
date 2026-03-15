@@ -22,18 +22,19 @@ class SSEManager:
         """Добавляет клиента, возвращает очередь для чтения."""
         q: asyncio.Queue = asyncio.Queue()
         self._queues.append(q)
-        log.debug("SSE client connected, total=%d", len(self._queues))
+        log.info("SSE client connected, total=%d", len(self._queues))
         return q
 
     def remove_client(self, q: asyncio.Queue) -> None:
         """Удаляет клиента."""
         if q in self._queues:
             self._queues.remove(q)
-        log.debug("SSE client disconnected, total=%d", len(self._queues))
+        log.info("SSE client disconnected, total=%d", len(self._queues))
 
     async def broadcast(self, event: str, data: dict | None = None) -> None:
         """Рассылает событие всем подключённым клиентам."""
         payload = json.dumps({"event": event, "data": data or {}})
+        log.info("SSE broadcast: event=%s data=%s clients=%d", event, data, len(self._queues))
         for q in list(self._queues):
             try:
                 q.put_nowait(payload)
