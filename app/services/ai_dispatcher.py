@@ -7,6 +7,7 @@
 """
 
 import logging
+from datetime import datetime
 
 from sqlalchemy import select
 
@@ -59,7 +60,7 @@ async def process_incoming_client_message(
         if not recent_messages:
             return
 
-        draft = await generate_draft(recent_messages)
+        draft, request_operator = await generate_draft(recent_messages)
         if not draft:
             log.warning(
                 "Не удалось сгенерировать ИИ-ответ для conversation_id=%s, mode=%s",
@@ -67,6 +68,10 @@ async def process_incoming_client_message(
                 mode,
             )
             return
+
+        if request_operator:
+            conv.specialist_requested = True
+            conv.specialist_requested_at = datetime.utcnow()
 
         if mode == INTERCEPT_MODE_PROMPTER:
             conv.pending_draft = draft
@@ -82,6 +87,14 @@ async def process_incoming_client_message(
             is_read=False,
         )
         session.add(ai_message)
+        if request_operator:
+            system_msg = Message(
+                conversation_id=conversation_id,
+                content="Перевожу диалог на специалиста, пожалуйста, ожидайте.",
+                sender="system",
+                is_read=False,
+            )
+            session.add(system_msg)
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
