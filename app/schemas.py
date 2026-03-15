@@ -51,6 +51,7 @@ class ConversationSchema(BaseModel):
     social_id: str
     label: str
     intercept_mode: str = "bot"
+    specialist_requested: bool = False
     pending_draft: Optional[str] = ""
     messages: list[MessageSchema] = []
 
