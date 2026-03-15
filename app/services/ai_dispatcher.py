@@ -70,11 +70,10 @@ async def process_incoming_client_message(
             )
             return
 
-        if request_operator:
-            conv.specialist_requested = True
-            conv.specialist_requested_at = datetime.utcnow()
-
         if mode == INTERCEPT_MODE_PROMPTER:
+            if request_operator:
+                conv.specialist_requested = True
+                conv.specialist_requested_at = datetime.utcnow()
             conv.pending_draft = draft
             conv.pending_draft_message_id = message_id
             conv.last_ai_handled_message_id = message_id
@@ -98,6 +97,8 @@ async def process_incoming_client_message(
                 is_read=False,
             )
             session.add(system_msg)
+            conv.specialist_requested = True
+            conv.specialist_requested_at = datetime.utcnow()
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
