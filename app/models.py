@@ -96,6 +96,7 @@ class Conversation(Base):
     label: Mapped[str] = mapped_column(String(255), default="")
     intercept_mode: Mapped[str] = mapped_column(String(30), default="bot")
     specialist_requested: Mapped[bool] = mapped_column(Boolean, default=False)
+    specialist_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     pending_draft: Mapped[str] = mapped_column(Text, default="")
     pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
