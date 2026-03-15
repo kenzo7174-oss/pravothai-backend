@@ -11,7 +11,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 APP_ENV = os.getenv("APP_ENV", "development")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "axoloti-dev-secret-change-me-in-production")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "1440"))
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
 TELEGRAM_WEBHOOK_AUTOMATION_ENABLED = os.getenv("TELEGRAM_WEBHOOK_AUTOMATION_ENABLED", "true").lower() == "true"
 TELEGRAM_WEBHOOK_PATH = os.getenv("TELEGRAM_WEBHOOK_PATH", "/api/v1/webhooks/telegram")
 TELEGRAM_WEBHOOK_PUBLIC_URL = os.getenv("WEBHOOK_DOMAIN", os.getenv("TELEGRAM_WEBHOOK_PUBLIC_URL", "")).strip().rstrip("/")
