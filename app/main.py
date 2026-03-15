@@ -240,6 +240,11 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE conversations ADD COLUMN last_ai_handled_message_id INTEGER"
             ))
+        if "specialist_requested" not in existing_columns:
+            default_val = "0" if not is_postgres() else "false"
+            await conn.execute(text(
+                f"ALTER TABLE conversations ADD COLUMN specialist_requested BOOLEAN NOT NULL DEFAULT {default_val}"
+            ))
 
         msg_columns = await _get_table_columns(conn, "messages")
 
@@ -488,6 +493,8 @@ async def create_message(
     if body.sender != "client":
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
+        # Оператор ответил — сбрасываем флаг запроса специалиста
+        conv.specialist_requested = False
 
     # Нормализация sender: support → operator для совместимости с виджетом и схемой
     sender = body.sender
@@ -516,6 +523,20 @@ async def create_message(
             )
 
     return msg
+
+
+# Ключевые слова для определения запроса клиентом специалиста
+_SPECIALIST_REQUEST_PATTERNS = re.compile(
+    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|хочу\s+поговорить|соедините|позовите|позвать)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_specialist_request(text: str) -> bool:
+    """Проверяет, просит ли клиент специалиста/оператора."""
+    if not text or not isinstance(text, str):
+        return False
+    return bool(_SPECIALIST_REQUEST_PATTERNS.search(text.strip()))
 
 
 def _normalize_intercept_mode(mode: str | None) -> str:
@@ -618,6 +639,10 @@ async def update_intercept_mode(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
 
+    # Оператор перехватил управление — сбрасываем флаг запроса специалиста
+    if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        conv.specialist_requested = False
+
     # Скрытое системное сообщение при перехвате (видны только в Терминале)
     if prev_mode == INTERCEPT_MODE_BOT and new_mode in {
         INTERCEPT_MODE_PROMPTER,
@@ -704,13 +729,15 @@ async def generate_draft_endpoint(
     if not recent:
         raise HTTPException(status_code=400, detail="No messages in conversation")
 
-    draft = await generate_draft(recent)
+    draft, request_operator = await generate_draft(recent)
     if draft is None:
         raise HTTPException(status_code=502, detail="Failed to generate draft")
 
     conv.pending_draft = draft
     latest_client_msg = next((msg for msg in reversed(recent) if msg.sender == "client"), None)
     conv.pending_draft_message_id = latest_client_msg.id if latest_client_msg else None
+    if request_operator:
+        conv.specialist_requested = True
     await session.commit()
 
     return {"draft": draft}
@@ -842,6 +869,13 @@ async def telegram_webhook(
     # Извлечение контактов и авто-склейка с дублем по email/phone
     if client:
         await _apply_contacts_and_auto_merge(session, client, text)
+
+    # Клиент просит специалиста — устанавливаем флаг для уведомления оператора
+    if _detect_specialist_request(text) and conv.intercept_mode in {
+        INTERCEPT_MODE_BOT,
+        INTERCEPT_MODE_PROMPTER,
+    }:
+        conv.specialist_requested = True
 
     await session.commit()
     await session.refresh(msg)
@@ -1169,6 +1203,13 @@ async def web_widget_webhook(
     if client:
         client = await _apply_contacts_and_auto_merge(session, client, text)
 
+    # Клиент просит специалиста — устанавливаем флаг для уведомления оператора
+    if _detect_specialist_request(text) and conv.intercept_mode in {
+        INTERCEPT_MODE_BOT,
+        INTERCEPT_MODE_PROMPTER,
+    }:
+        conv.specialist_requested = True
+
     await session.commit()
     await session.refresh(msg)
 
@@ -1187,7 +1228,10 @@ async def web_widget_webhook(
         .limit(10)
     )
     recent = list(reversed(result.scalars().all()))
-    draft = await generate_draft(recent)
+    draft, request_operator = await generate_draft(recent)
+
+    if request_operator:
+        conv.specialist_requested = True
 
     if draft:
         ai_msg = Message(
@@ -1200,6 +1244,8 @@ async def web_widget_webhook(
         session.add(ai_msg)
         await session.commit()
         await session.refresh(ai_msg)
+    elif request_operator:
+        await session.commit()
 
     return {
         "reply": draft or "Извините, не удалось сформировать ответ. Попробуйте позже.",
