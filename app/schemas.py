@@ -69,6 +69,7 @@ class InterceptModeUpdate(BaseModel):
     device_id: Optional[str] = None
     operator_name: Optional[str] = None
     operator_role: Optional[str] = None
+    senior_welcome_message: Optional[str] = None
 
 
 class SystemSettingsSchema(BaseModel):
