@@ -449,12 +449,19 @@ app = FastAPI(
 )
 
 # ── CORS (сразу после app, выше маршрутов) ─────────────────────────────────
-# Разрешаем фронтенд (localhost:5173 Vite, localhost:3000) и SSE. allow_credentials=False
-# требуется при allow_origins=["*"] по спецификации CORS.
+# Разрешаем виджет (axoloti.ru), фронтенд (localhost) и SSE.
+CORS_ORIGINS = [
+    "http://axoloti.ru",
+    "https://axoloti.ru",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:3000",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -868,9 +875,9 @@ async def update_intercept_mode(
         session.add(internal_msg)
         await session.flush()
 
-    # При переключении на senior — отправляем уведомление клиенту (из SystemSettings)
+    # При переключении на senior — отправляем уведомление клиенту (из запроса или SystemSettings)
     if conv.intercept_mode == INTERCEPT_MODE_SENIOR:
-        senior_text = await _get_senior_welcome_message(session)
+        senior_text = (body.senior_welcome_message or "").strip() or await _get_senior_welcome_message(session)
         sys_msg = Message(
             conversation_id=conv.id,
             content=senior_text,
