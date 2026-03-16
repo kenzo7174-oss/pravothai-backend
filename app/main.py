@@ -860,8 +860,9 @@ async def update_intercept_mode(
         device_id = (body.device_id or "").strip() or "—"
         operator_name = (body.operator_name or "").strip() or "Оператор"
         operator_role = (body.operator_role or "").strip() or "Специалист"
+        operator_os = (body.operator_os or "").strip() or "—"
         internal_text = (
-            f"Оператор {operator_name} ({operator_role}, ID: {device_id}) "
+            f"{operator_name} ({operator_role}) • {operator_os} • {device_id} — "
             f"перехватил управление. Режим: {new_mode}"
         )
         internal_msg = Message(
