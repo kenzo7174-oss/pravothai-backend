@@ -34,6 +34,7 @@ from app.models import (
     Conversation,
     Message,
     Operator,
+    ScheduledBroadcast,
     SystemSettings,
     DEFAULT_SENIOR_WELCOME_MESSAGE,
 )
@@ -431,8 +432,14 @@ async def lifespan(app: FastAPI):
     await seed_default_operator()
     await register_telegram_webhook_on_startup()
     sla_task = asyncio.create_task(sla_monitor_loop())
+    broadcast_scheduler_task = asyncio.create_task(_scheduled_broadcast_loop())
     log.info("FastAPI startup complete")
     yield
+    broadcast_scheduler_task.cancel()
+    try:
+        await broadcast_scheduler_task
+    except asyncio.CancelledError:
+        pass
     sla_task.cancel()
     try:
         await sla_task
@@ -744,28 +751,84 @@ async def create_message(
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-async def _run_broadcast_task(text: str, client_ids: list[int]) -> None:
+async def _scheduled_broadcast_loop() -> None:
+    """Фоновый цикл: каждые 60 секунд проверяет запланированные рассылки и запускает их."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = datetime.now(timezone.utc)
+            # naive datetime для сравнения с БД (SQLite хранит без tz)
+            now_naive = now.replace(tzinfo=None) if now.tzinfo else now
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(ScheduledBroadcast)
+                    .where(
+                        ScheduledBroadcast.is_sent == False,
+                        ScheduledBroadcast.scheduled_at <= now_naive,
+                    )
+                )
+                rows = list(result.scalars().all())
+            for row in rows:
+                try:
+                    raw = row.recipients if isinstance(row.recipients, list) else []
+                    recipients = _normalize_recipients(raw)
+                    if recipients:
+                        await _run_broadcast_task(row.text, recipients)
+                    async with AsyncSessionLocal() as session:
+                        sb = await session.get(ScheduledBroadcast, row.id)
+                        if sb:
+                            sb.is_sent = True
+                            await session.commit()
+                    log.info("Scheduled broadcast #%s sent", row.id)
+                except Exception as e:
+                    log.error("Scheduled broadcast #%s failed: %s", row.id, e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Scheduled broadcast loop error: %s", e)
+
+
+def _normalize_recipients(raw: list) -> list[dict]:
+    """Приводит recipients к формату [{client_id, source}]. Поддержка legacy [1,2,3]."""
+    if not raw:
+        return []
+    first = raw[0]
+    if isinstance(first, dict) and "client_id" in first and "source" in first:
+        return [{"client_id": int(r["client_id"]), "source": str(r["source"])} for r in raw]
+    return [{"client_id": int(x), "source": None} for x in raw]  # legacy: source=None = все каналы
+
+
+async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
     """
-    Фоновая задача рассылки: достаёт клиентов по ID из БД,
-    отправляет каждому персонализированное сообщение с паузой 1 сек (защита от rate limits).
+    Фоновая задача рассылки. recipients: [{client_id, source}, ...].
+    source=None (legacy) = отправить во все каналы клиента.
     """
-    if not client_ids:
+    if not recipients:
         return
+    client_ids = list({r["client_id"] for r in recipients})
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Client)
             .where(Client.id.in_(client_ids), Client.is_archived == False)
             .options(selectinload(Client.conversations))
         )
-        clients = list(result.scalars().all())
+        clients_by_id = {c.id: c for c in result.scalars().all()}
 
-    for client in clients:
-        if not client.conversations:
+    for rec in recipients:
+        client_id = rec["client_id"]
+        source = rec.get("source")
+        client = clients_by_id.get(client_id)
+        if not client or not client.conversations:
             continue
         client_name = (client.name or "Клиент").strip() or "Клиент"
         personalized_text = text.replace("{name}", client_name)
 
-        for conv in client.conversations:
+        convs = (
+            [c for c in client.conversations if c.source == source]
+            if source
+            else client.conversations
+        )
+        for conv in convs:
             try:
                 async with AsyncSessionLocal() as session:
                     msg = Message(
@@ -796,20 +859,43 @@ async def start_broadcast(
     _: Operator = Depends(get_current_operator),
 ):
     """
-    Запускает рассылку в фоне. Принимает text и client_ids — точный список ID получателей.
+    Запускает рассылку в фоне. Принимает text и recipients — список {client_id, source}.
     """
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
-    try:
-        client_ids = [int(x) for x in (body.client_ids or []) if x is not None]
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="client_ids must be a list of integers")
-    if not client_ids:
-        raise HTTPException(status_code=400, detail="client_ids is required and cannot be empty")
+    recipients = [
+        {"client_id": int(r.client_id), "source": str(r.source)}
+        for r in (body.recipients or [])
+        if r is not None
+    ]
+    if not recipients:
+        raise HTTPException(status_code=400, detail="recipients is required and cannot be empty")
 
-    background_tasks.add_task(_run_broadcast_task, text, client_ids)
-    return {"status": "started", "message": "Рассылка запущена в фоновом режиме"}
+    scheduled_at = body.scheduled_at
+    if scheduled_at is None:
+        background_tasks.add_task(_run_broadcast_task, text, recipients)
+        return {"status": "started", "message": "Рассылка запущена в фоновом режиме"}
+
+    # Запланировать: сохраняем в ScheduledBroadcast (naive UTC для SQLite)
+    dt = scheduled_at
+    if hasattr(dt, "tzinfo") and dt.tzinfo is not None:
+        dt = (dt.astimezone(timezone.utc)).replace(tzinfo=None)
+    elif isinstance(dt, str):
+        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    async with AsyncSessionLocal() as session:
+        sb = ScheduledBroadcast(
+            text=text,
+            recipients=recipients,
+            scheduled_at=dt,
+            is_sent=False,
+        )
+        session.add(sb)
+        await session.commit()
+    return {"status": "scheduled", "message": "Рассылка запланирована"}
 
 
 # Ключевые слова для определения запроса клиентом специалиста
