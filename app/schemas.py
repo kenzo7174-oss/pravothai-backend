@@ -120,10 +120,31 @@ class ClientUpdate(BaseModel):
         return v
 
 
+class BroadcastRecipient(BaseModel):
+    """Один получатель рассылки: клиент + канал."""
+    client_id: int
+    source: str  # telegram / web_widget / whatsapp / ...
+
+
 class BroadcastRequest(BaseModel):
     """Запрос на запуск рассылки."""
     text: str
-    client_ids: list[int] = []  # точный список ID получателей
+    recipients: list[BroadcastRecipient] = []  # список (client_id, source)
+    scheduled_at: Optional[datetime] = None  # ISO-строка или null = отправить сейчас
+
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def _parse_scheduled_at(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+        return None
 
 
 class ClientSchema(BaseModel):
