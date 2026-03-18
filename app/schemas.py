@@ -132,6 +132,17 @@ class BroadcastRequest(BaseModel):
     recipients: list[BroadcastRecipient] = []  # список (client_id, source)
     scheduled_at: Optional[datetime] = None  # ISO-строка или null = отправить сейчас
 
+
+class ScheduledBroadcastSchema(BaseModel):
+    """Запланированная рассылка (ответ API)."""
+    id: int
+    text: str
+    recipients: list[dict]  # [{client_id, source}, ...] или legacy [1,2,3]
+    scheduled_at: datetime
+    is_sent: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
     @field_validator("scheduled_at", mode="before")
     @classmethod
     def _parse_scheduled_at(cls, v):
