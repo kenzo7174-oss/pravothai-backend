@@ -1199,7 +1199,7 @@ async def telegram_webhook(
     try:
         update = await request.json()
     except Exception as e:
-        print(f"ERROR telegram_webhook JSON: {e}")
+        log.warning("telegram_webhook invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     tg_message = update.get("message") or update.get("edited_message")
@@ -1329,18 +1329,13 @@ async def telegram_webhook(
 
 def _get_client_ip(request: Request) -> str:
     """Извлекает реальный IP клиента. Учитывает Render: X-Forwarded-For, X-Real-IP."""
-    headers = {
-        "X-Forwarded-For": request.headers.get("X-Forwarded-For"),
-        "X-Real-IP": request.headers.get("X-Real-IP"),
-    }
-    print(f"DEBUG IP: {headers}")
-    forwarded = headers["X-Forwarded-For"]
+    forwarded = request.headers.get("X-Forwarded-For")
     if forwarded and forwarded.strip():
         # Первый адрес в списке — клиент, остальные — прокси
         first = forwarded.split(",")[0].strip()
         if first:
             return first
-    real_ip = headers["X-Real-IP"]
+    real_ip = request.headers.get("X-Real-IP")
     if real_ip and real_ip.strip():
         return real_ip.strip()
     if request.client:
@@ -1515,7 +1510,7 @@ async def web_widget_webhook(
     try:
         body = await request.json()
     except Exception as e:
-        print(f"ERROR web_widget_webhook JSON: {e}")
+        log.warning("web_widget_webhook invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
     text = (body.get("message") or "").strip()
