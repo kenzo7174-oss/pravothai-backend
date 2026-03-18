@@ -40,6 +40,7 @@ from app.models import (
 )
 from app.schemas import (
     BroadcastRequest,
+    ScheduledBroadcastSchema,
     ClientMergeRequest,
     ClientSchema,
     ClientUpdate,
@@ -820,7 +821,7 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
         client = clients_by_id.get(client_id)
         if not client or not client.conversations:
             continue
-        client_name = (client.name or "Клиент").strip() or "Клиент"
+        client_name = (client.name or "Пользователь").strip() or "Пользователь"
         personalized_text = text.replace("{name}", client_name)
 
         convs = (
@@ -896,6 +897,45 @@ async def start_broadcast(
         session.add(sb)
         await session.commit()
     return {"status": "scheduled", "message": "Рассылка запланирована"}
+
+
+@app.get("/api/v1/broadcasts/scheduled", response_model=list[ScheduledBroadcastSchema])
+async def list_scheduled_broadcasts(
+    _: Operator = Depends(get_current_operator),
+):
+    """Список запланированных рассылок (is_sent=False), отсортированных по времени."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScheduledBroadcast)
+            .where(ScheduledBroadcast.is_sent == False)
+            .order_by(ScheduledBroadcast.scheduled_at.asc())
+        )
+        rows = list(result.scalars().all())
+    return [
+        ScheduledBroadcastSchema(
+            id=r.id,
+            text=r.text,
+            recipients=r.recipients if isinstance(r.recipients, list) else [],
+            scheduled_at=r.scheduled_at.replace(tzinfo=timezone.utc) if r.scheduled_at and r.scheduled_at.tzinfo is None else r.scheduled_at,
+            is_sent=r.is_sent,
+        )
+        for r in rows
+    ]
+
+
+@app.delete("/api/v1/broadcasts/scheduled/{broadcast_id}")
+async def delete_scheduled_broadcast(
+    broadcast_id: int,
+    _: Operator = Depends(get_current_operator),
+):
+    """Удаляет запланированную рассылку по ID."""
+    async with AsyncSessionLocal() as session:
+        sb = await session.get(ScheduledBroadcast, broadcast_id)
+        if not sb:
+            raise HTTPException(status_code=404, detail="Scheduled broadcast not found")
+        await session.delete(sb)
+        await session.commit()
+    return {"status": "deleted", "message": "Рассылка отменена"}
 
 
 # Ключевые слова для определения запроса клиентом специалиста
