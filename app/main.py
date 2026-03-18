@@ -1342,7 +1342,7 @@ async def web_widget_webhook(
         result = await session.execute(
             select(Client).where(Client.axolotl_visitor_id == visitor_id)
         )
-        client = result.scalar_one_or_none()
+        client = result.scalars().first()
 
     if client is not None:
         # Клиент найден — обновляем техданные, НЕ создаём нового
@@ -1394,7 +1394,7 @@ async def web_widget_webhook(
                     Conversation.social_id == str(thread_id_raw),
                 )
             )
-            conv = result.scalar_one_or_none()
+            conv = result.scalars().first()
 
         # thread_id должен указывать на диалог нашего клиента, иначе — игнорируем
         if conv is not None and conv.client_id != client.id:
@@ -1407,7 +1407,7 @@ async def web_widget_webhook(
                 Conversation.client_id == client.id,
             )
         )
-        conv = result.scalar_one_or_none()
+        conv = result.scalars().first()
 
     if conv is None:
         social_id = visitor_id or str(uuid.uuid4())
