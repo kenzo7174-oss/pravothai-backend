@@ -12,6 +12,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    JSON,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -158,3 +159,20 @@ class SystemSettings(Base):
 
     def __repr__(self) -> str:
         return f"<SystemSettings id={self.id}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SCHEDULED BROADCAST — Отложенная рассылка
+# ═══════════════════════════════════════════════════════════════════════════
+class ScheduledBroadcast(Base):
+    """Запланированная рассылка (отложенная по времени)."""
+    __tablename__ = "scheduled_broadcasts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    recipients: Mapped[list] = mapped_column("client_ids", JSON, nullable=False)  # [{"client_id": 1, "source": "telegram"}, ...]; legacy: [1,2,3]
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)  # UTC
+    is_sent: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    def __repr__(self) -> str:
+        return f"<ScheduledBroadcast #{self.id} at {self.scheduled_at}>"
