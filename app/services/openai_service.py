@@ -1,12 +1,14 @@
 """
 Сервис генерации черновиков через OpenAI Responses API.
 
-Использует кастомный промпт (OPENAI_RESPONSE_ID) как базу знаний и Function Calling
-для передачи диалога оператору.
+Использует системный промпт (роль продажника Axoloti) и ожидает JSON-ответ
+вида { "message": "...", "request_operator": false }.
 """
 
 import io
+import json
 import logging
+import re
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -21,21 +23,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-OFF_HOURS_INSTRUCTION = """CRITICAL: Сейчас нерабочее время. Вызывать request_human_operator ЗАПРЕЩЕНО. ПРАВИЛО: Никак не упоминай рабочее время и отсутствие людей, общайся как обычно. ЕСЛИ клиент прямо просит позвать оператора/человека — только тогда (и ни в коем случае не раньше) коротко в 1 предложение извинись, скажи, что сейчас операторов нет, и предложи свою помощь."""
+OFF_HOURS_INSTRUCTION = """Сейчас нерабочее время. В JSON всегда используй "request_operator": false. ПРАВИЛО: Никак не упоминай рабочее время и отсутствие людей, общайся как обычно. ЕСЛИ клиент прямо просит позвать оператора — коротко извинись и предложи свою помощь."""
 
-# Инструкции для модели. База знаний настраивается в промпте OPENAI_RESPONSE_ID.
-TECHNICAL_INSTRUCTIONS = """Ты — ассистент поддержки. Отвечай на основе базы знаний из промпта.
-Если клиент просит позвать оператора, человека или специалиста — вызови инструмент request_human_operator.
-Также вызывай его, если не можешь решить проблему пользователя.
-
-CRITICAL: ЗАПРЕЩЕНО вызывать функцию `request_human_operator` в ответ на базовые приветствия ('привет', 'здравствуйте') или общие вопросы. Вызов разрешен ТОЛЬКО при прямом требовании позвать человека или полном отсутствии ответа в базе знаний."""
-
-# Инструмент для передачи диалога оператору (Function Calling)
-REQUEST_HUMAN_OPERATOR_TOOL = {
-    "type": "function",
-    "name": "request_human_operator",
-    "description": "Вызывать строго при просьбе позвать оператора, человека, специалиста, или если ИИ не может решить проблему пользователя.",
-}
+SYSTEM_PROMPT = """БАЗА ЗНАНИЙ: Axoloti Terminal (LiveDesk)
+РОЛЬ И ЦЕЛЬ: Ты — проактивный ИИ-менеджер по продажам платформы Axoloti (робот-аксолотль). Твоя цель: продавать внедрение умного чата и переводить горячих лидов на оператора.
+СТРОГОЕ ПРАВИЛО: Ты продаешь IT-продукт. Никогда не предлагай помощь с документами или возвратами.
+1. О КОМПАНИИ: Axoloti — платформа для умной автоматизации поддержки малого бизнеса. ИИ отвечает на 80% вопросов, сложные передает оператору. Функции: ИИ-автопилот, Суфлёр, Саммари, CRM-блок.
+2. ЦЕНЫ: AI START (29 900 ₽), AI BUSINESS (54 900 ₽), Premium (89 900 ₽). Индивидуально от 19 900 ₽. Подключение: 1-7 дней.
+3. ОБЩЕНИЕ: На «Вы», продающий стиль, СТРОГО 2-4 предложения. В конце задавай вопрос о бизнесе клиента.
+4. ЭСКАЛАЦИЯ: Переводи на человека, если клиент пишет: «возврат средств», «жалоба», «суд», «позови человека», «менеджер» или есть агрессия. Фраза для перевода: "Перевожу вас на старшего специалиста, одну минуту..."
+5. ФОРМАТ ОТВЕТА (КРИТИЧЕСКИ ВАЖНО): Твой ответ ВСЕГДА строго в JSON без markdown-разметки: { "message": "Твой ответ", "request_operator": false }. Ставь true только при триггере эскалации."""
 
 SENDER_TO_ROLE = {
     "client": "user",
@@ -77,31 +74,58 @@ async def transcribe_voice(audio_data: bytes, filename: str = "voice.ogg") -> st
     return None
 
 
-def _parse_response_output(response) -> tuple[str | None, bool]:
-    """Извлекает текст ответа и флаг request_operator из output (включая tool calls)."""
+def _extract_text_from_response(response) -> str | None:
+    """Извлекает сырой текст ответа из output."""
     message_text: str | None = None
-    request_operator = False
-
-    for item in response.output:
-        if getattr(item, "type", None) == "function_call":
-            if getattr(item, "name", None) == "request_human_operator":
-                request_operator = True
-        elif getattr(item, "type", None) == "message":
+    for item in getattr(response, "output", []) or []:
+        if getattr(item, "type", None) == "message":
             for content in getattr(item, "content", []):
                 if getattr(content, "type", None) == "output_text":
                     text = getattr(content, "text", None) or ""
                     if text.strip():
                         message_text = (message_text or "") + text
-
-    # Fallback на output_text property если output пустой
-    if message_text is None and response.output_text:
+    if message_text is None and getattr(response, "output_text", None):
         message_text = response.output_text.strip() or None
+    return message_text
 
-    # При вызове request_human_operator без текста — используем фразу по умолчанию
-    if request_operator and not (message_text and message_text.strip()):
-        message_text = "Перевожу диалог на специалиста, пожалуйста, ожидайте."
 
-    return message_text, request_operator
+def _parse_json_response(text: str) -> tuple[str | None, bool]:
+    """Парсит JSON-ответ вида { "message": "...", "request_operator": false }."""
+    if not text or not text.strip():
+        return None, False
+    raw = text.strip()
+    # Убираем markdown-обёртки ```json ... ```
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+    if m:
+        raw = m.group(1).strip()
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            msg = data.get("message")
+            req_op = data.get("request_operator", False)
+            if msg is not None and isinstance(msg, str) and msg.strip():
+                return msg.strip(), bool(req_op)
+            if msg is not None:
+                return str(msg).strip() or None, bool(req_op)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None, False
+
+
+def _parse_response_output(response, use_json_format: bool = True) -> tuple[str | None, bool]:
+    """Извлекает текст ответа и флаг request_operator. Поддерживает JSON-формат."""
+    text = _extract_text_from_response(response)
+    if not text:
+        return None, False
+
+    if use_json_format:
+        message_text, request_operator = _parse_json_response(text)
+        if message_text is not None:
+            return message_text, request_operator
+        # Fallback: если JSON не распарсился, используем весь текст как сообщение
+        return text.strip(), False
+
+    return text.strip(), False
 
 
 def _parse_time(s: str) -> tuple[int, int] | None:
@@ -163,12 +187,12 @@ async def generate_draft(
         for msg in messages
     ]
 
-    instructions = TECHNICAL_INSTRUCTIONS
-    tools = [REQUEST_HUMAN_OPERATOR_TOOL]
+    instructions = SYSTEM_PROMPT
+    use_json_format = True
 
     if override_instructions:
         instructions = override_instructions
-        tools = []
+        use_json_format = False
     elif session:
         result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
         sys_settings = result.scalar_one_or_none()
@@ -176,13 +200,13 @@ async def generate_draft(
             start = getattr(sys_settings, "business_start", "09:00") or "09:00"
             end = getattr(sys_settings, "business_end", "18:00") or "18:00"
             if not _is_within_business_hours(start, end):
-                instructions = TECHNICAL_INSTRUCTIONS + "\n\n" + OFF_HOURS_INSTRUCTION
+                instructions = SYSTEM_PROMPT + "\n\n" + OFF_HOURS_INSTRUCTION
 
     create_params: dict = {
         "prompt": {"id": prompt_id},
         "instructions": instructions,
         "input": input_items,
-        "tools": tools,
+        "tools": [],
         "store": False,
     }
 
@@ -190,9 +214,7 @@ async def generate_draft(
         client = AsyncOpenAI(api_key=api_key)
         response = await client.responses.create(**create_params)
 
-        message_text, request_operator = _parse_response_output(response)
-        if not tools:
-            request_operator = False
+        message_text, request_operator = _parse_response_output(response, use_json_format=use_json_format)
         return message_text, request_operator
 
     except APIError as exc:
