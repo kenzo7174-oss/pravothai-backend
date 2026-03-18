@@ -120,6 +120,12 @@ class ClientUpdate(BaseModel):
         return v
 
 
+class BroadcastRequest(BaseModel):
+    """Запрос на запуск рассылки."""
+    text: str
+    client_ids: list[int] = []  # точный список ID получателей
+
+
 class ClientSchema(BaseModel):
     """Карточка клиента со всеми диалогами."""
     model_config = ConfigDict(from_attributes=True)
