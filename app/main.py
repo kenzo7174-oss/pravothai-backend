@@ -453,6 +453,8 @@ app = FastAPI(
 CORS_ORIGINS = [
     "http://axoloti.ru",
     "https://axoloti.ru",
+    "http://www.axoloti.ru",
+    "https://www.axoloti.ru",
     "http://localhost:5173",
     "http://localhost:3000",
     "http://127.0.0.1:5173",
@@ -460,7 +462,7 @@ CORS_ORIGINS = [
 ]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -656,6 +658,27 @@ async def get_clients(session: AsyncSession = Depends(get_session)):
     )
 
     return clients
+
+
+@app.get("/api/v1/clients/{client_id}", response_model=ClientSchema)
+async def get_client(
+    client_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """Возвращает одного клиента с диалогами (для подтягивания актуальных тегов и заметок при открытии чата)."""
+    query = (
+        select(Client)
+        .where(Client.id == client_id)
+        .options(
+            selectinload(Client.conversations)
+            .selectinload(Conversation.messages)
+        )
+    )
+    result = await session.execute(query)
+    client = result.scalar_one_or_none()
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return client
 
 
 # ═══════════════════════════════════════════════════════════════════════════
