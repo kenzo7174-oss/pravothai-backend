@@ -38,6 +38,7 @@ from app.models import (
     DEFAULT_SENIOR_WELCOME_MESSAGE,
 )
 from app.schemas import (
+    BroadcastRequest,
     ClientMergeRequest,
     ClientSchema,
     ClientUpdate,
@@ -736,6 +737,79 @@ async def create_message(
             )
 
     return msg
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  API v1 — Рассылка (Broadcast)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+async def _run_broadcast_task(text: str, client_ids: list[int]) -> None:
+    """
+    Фоновая задача рассылки: достаёт клиентов по ID из БД,
+    отправляет каждому персонализированное сообщение с паузой 1 сек (защита от rate limits).
+    """
+    if not client_ids:
+        return
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Client)
+            .where(Client.id.in_(client_ids), Client.is_archived == False)
+            .options(selectinload(Client.conversations))
+        )
+        clients = list(result.scalars().all())
+
+    for client in clients:
+        if not client.conversations:
+            continue
+        client_name = (client.name or "Клиент").strip() or "Клиент"
+        personalized_text = text.replace("{name}", client_name)
+
+        for conv in client.conversations:
+            try:
+                async with AsyncSessionLocal() as session:
+                    msg = Message(
+                        conversation_id=conv.id,
+                        content=personalized_text,
+                        sender="operator",
+                        is_read=False,
+                    )
+                    session.add(msg)
+                    await session.commit()
+
+                    if conv.source == "telegram" and conv.social_id:
+                        ok = await send_telegram_message(conv.social_id, personalized_text)
+                        if not ok:
+                            log.warning(
+                                "Broadcast: не удалось отправить в Telegram (conv=%s)",
+                                conv.id,
+                            )
+            except Exception as e:
+                log.error("Broadcast: ошибка отправки клиенту %s: %s", client.id, e)
+            await asyncio.sleep(1)
+
+
+@app.post("/api/v1/broadcast")
+async def start_broadcast(
+    body: BroadcastRequest,
+    background_tasks: BackgroundTasks,
+    _: Operator = Depends(get_current_operator),
+):
+    """
+    Запускает рассылку в фоне. Принимает text и client_ids — точный список ID получателей.
+    """
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    try:
+        client_ids = [int(x) for x in (body.client_ids or []) if x is not None]
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="client_ids must be a list of integers")
+    if not client_ids:
+        raise HTTPException(status_code=400, detail="client_ids is required and cannot be empty")
+
+    background_tasks.add_task(_run_broadcast_task, text, client_ids)
+    return {"status": "started", "message": "Рассылка запущена в фоновом режиме"}
 
 
 # Ключевые слова для определения запроса клиентом специалиста
