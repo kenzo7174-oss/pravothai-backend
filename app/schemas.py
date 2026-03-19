@@ -50,6 +50,7 @@ class ConversationSchema(BaseModel):
     source: str          # telegram / whatsapp / site
     social_id: str
     label: str
+    original_name: str = ""  # Имя для списка чатов (канал-специфичное)
     intercept_mode: str = "bot"
     specialist_requested: bool = False
     specialist_requested_at: Optional[datetime] = None
@@ -97,7 +98,7 @@ class ClientMergeRequest(BaseModel):
 
 
 class ClientUpdate(BaseModel):
-    """Частичное обновление карточки клиента."""
+    """Частичное обновление карточки клиента. original_name не обновляется."""
     name: Optional[str] = None
     phone: Optional[str] = None
     email: Optional[str] = None
@@ -164,6 +165,7 @@ class ClientSchema(BaseModel):
 
     id: int
     name: str
+    original_name: str = ""
     avatar: str
     phone: str
     email: str
