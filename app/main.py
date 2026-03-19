@@ -310,6 +310,11 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE conversations ADD COLUMN original_name VARCHAR(120) NOT NULL DEFAULT ''"
             ))
+        if "has_new_contact" not in conv_columns:
+            default_bool = "0" if not is_postgres() else "false"
+            await conn.execute(text(
+                f"ALTER TABLE conversations ADD COLUMN has_new_contact BOOLEAN NOT NULL DEFAULT {default_bool}"
+            ))
 
         # system_settings (рабочие часы, SLA)
         ss_columns = await _get_table_columns(conn, "system_settings")
@@ -1052,6 +1057,19 @@ def _detect_specialist_request(text: str) -> bool:
     return bool(_SPECIALIST_REQUEST_PATTERNS.search(text.strip()))
 
 
+# Regex: телефон (10+ цифр, возможно с +) или email
+_CONTACT_PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{9,}\d|\d{10,}")
+_CONTACT_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+
+
+def _detect_contact_in_text(text: str) -> bool:
+    """Проверяет, есть ли в тексте телефон (10+ цифр) или email."""
+    if not text or not isinstance(text, str):
+        return False
+    t = text.strip()
+    return bool(_CONTACT_PHONE_RE.search(t) or _CONTACT_EMAIL_RE.search(t))
+
+
 def _normalize_intercept_mode(mode: str | None) -> str:
     """Нормализует режим: full_control → manual, невалидные → bot."""
     if not mode:
@@ -1142,6 +1160,31 @@ async def update_conversation(
     await session.commit()
     await session.refresh(conv)
     return {"id": conv.id, "tags": conv.tags}
+
+
+@app.patch("/api/v1/conversations/{conversation_id}/clear-contact", status_code=200)
+async def clear_conversation_contact(
+    conversation_id: int,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Сбрасывает флаг has_new_contact в False после обработки контакта."""
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    conv.has_new_contact = False
+    await session.commit()
+    await session.refresh(conv)
+    result = await session.execute(
+        select(Client)
+        .where(Client.id == conv.client_id)
+        .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+    )
+    client = result.scalar_one_or_none()
+    if client:
+        client_data = ClientSchema.model_validate(client).model_dump(mode="json")
+        await sse_manager.broadcast("client_updated", {"client": client_data})
+    return {"id": conv.id, "has_new_contact": False}
 
 
 @app.patch("/api/v1/conversations/{conversation_id}/intercept-mode")
@@ -1414,8 +1457,24 @@ async def telegram_webhook(
     }:
         conv.specialist_requested = True
 
+    # Детектор контактов: телефон или email в сообщении
+    if _detect_contact_in_text(text):
+        conv.has_new_contact = True
+
     await session.commit()
     await session.refresh(msg)
+
+    if conv.has_new_contact or conv.specialist_requested:
+        async with AsyncSessionLocal() as s:
+            r = await s.execute(
+                select(Client)
+                .where(Client.id == conv.client_id)
+                .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+            )
+            c = r.scalar_one_or_none()
+            if c:
+                client_data = ClientSchema.model_validate(c).model_dump(mode="json")
+                await sse_manager.broadcast("client_updated", {"client": client_data})
 
     if conv.intercept_mode in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER}:
         background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
@@ -1764,8 +1823,24 @@ async def web_widget_webhook(
     }:
         conv.specialist_requested = True
 
+    # Детектор контактов: телефон или email в сообщении
+    if _detect_contact_in_text(text):
+        conv.has_new_contact = True
+
     await session.commit()
     await session.refresh(msg)
+
+    if conv.has_new_contact or conv.specialist_requested:
+        async with AsyncSessionLocal() as s:
+            r = await s.execute(
+                select(Client)
+                .where(Client.id == conv.client_id)
+                .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+            )
+            c = r.scalar_one_or_none()
+            if c:
+                client_data = ClientSchema.model_validate(c).model_dump(mode="json")
+                await sse_manager.broadcast("client_updated", {"client": client_data})
 
     if conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
         did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
