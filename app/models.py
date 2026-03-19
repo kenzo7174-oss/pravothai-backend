@@ -102,6 +102,7 @@ class Conversation(Base):
     pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tags: Mapped[str] = mapped_column(String(500), default="")
+    last_interaction_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     messages: Mapped[List["Message"]] = relationship(
         back_populates="conversation",
