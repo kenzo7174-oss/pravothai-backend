@@ -40,7 +40,8 @@ class Client(Base):
     __tablename__ = "clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)  # Глобальное имя (оператор меняет вручную)
+    original_name: Mapped[str] = mapped_column(String(120), default="")  # Имя из мессенджера или "Посетитель #X"
     avatar: Mapped[str] = mapped_column(String(500), default="")
     
     # 🟢 КОНТАКТЫ И ПРОФИЛЬ (Добавлены новые поля)
@@ -95,6 +96,7 @@ class Conversation(Base):
     source: Mapped[str] = mapped_column(String(30), nullable=False)
     social_id: Mapped[str] = mapped_column(String(120), default="")
     label: Mapped[str] = mapped_column(String(255), default="")
+    original_name: Mapped[str] = mapped_column(String(120), default="")  # Имя для списка чатов (канал/канал)
     intercept_mode: Mapped[str] = mapped_column(String(30), default="bot")
     specialist_requested: Mapped[bool] = mapped_column(Boolean, default=False)
     specialist_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
