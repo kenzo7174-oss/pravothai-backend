@@ -1449,15 +1449,23 @@ def _get_client_ip(request: Request) -> str:
 
 
 def _extract_city_for_visitor(location: str) -> str:
-    """Извлекает город из location для шаблона «Посетитель #X (город)». Если нет — «Инкогнито»."""
+    """Извлекает город из location. Пустая строка = город не определён (не писать «Инкогнито»)."""
     if not location or not location.strip():
-        return "Инкогнито"
+        return ""
     loc = location.strip()
     if loc in ("Сеть клиента", "Локальная сеть"):
-        return "Инкогнито"
+        return ""
     if "," in loc:
-        return loc.split(",")[0].strip() or "Инкогнито"
+        return loc.split(",")[0].strip() or ""
     return loc
+
+
+def _make_visitor_name(city: str = "") -> str:
+    """Генерирует имя «Посетитель #XXXX» или «Посетитель #XXXX (город)». Всегда 4 случайные цифры."""
+    random_num = random.randint(1000, 9999)
+    if city and city.strip():
+        return f"Посетитель #{random_num} ({city.strip()})"
+    return f"Посетитель #{random_num}"
 
 
 async def _fetch_geolocation(ip: str) -> str:
@@ -1668,10 +1676,9 @@ async def web_widget_webhook(
             client.os_device = os_device
         await session.flush()
     else:
-        # Клиент НЕ найден — создаём нового. Имя: «Посетитель #{random_id} ({city})»
+        # Клиент НЕ найден — создаём нового. Имя строго: «Посетитель #XXXX» или «Посетитель #XXXX (город)»
         city = _extract_city_for_visitor(location)
-        random_id = f"{random.randint(1000, 9999)}"
-        visitor_name = f"Посетитель #{random_id} ({city})"
+        visitor_name = _make_visitor_name(city)
         client = Client(
             name=visitor_name,
             original_name=visitor_name,
@@ -1689,10 +1696,6 @@ async def web_widget_webhook(
             os_device=os_device,
         )
         session.add(client)
-        await session.flush()
-        # Обновляем на последние 4 цифры ID для уникальности
-        client.name = f"Посетитель #{str(client.id)[-4:].zfill(4)} ({city})"
-        client.original_name = client.name
         await session.flush()
 
     # Теперь ищем диалог для этого клиента
@@ -1929,9 +1932,17 @@ async def detach_conversation(
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    # Имя: если у conv/source уже есть original_name — оставляем; иначе генерируем по правилу
+    source_client = await session.get(Client, conv.client_id)
+    existing_name = (conv.original_name or "").strip() or (source_client.original_name if source_client else "")
+    if existing_name and existing_name.strip():
+        visitor_label = existing_name.strip()
+    else:
+        visitor_label = _make_visitor_name("")
+
     new_client = Client(
-        name="Посетитель (Инкогнито)",
-        original_name="",
+        name=visitor_label,
+        original_name=visitor_label,
         avatar="",
         phone="",
         email="",
@@ -1948,9 +1959,6 @@ async def detach_conversation(
     await session.flush()
 
     conv.client_id = new_client.id
-    visitor_label = f"Посетитель #{str(new_client.id)[-4:].zfill(4)} (Инкогнито)"
-    new_client.name = visitor_label
-    new_client.original_name = visitor_label
     conv.original_name = visitor_label
     conv.label = f"Web: {visitor_label}"
     await session.flush()
