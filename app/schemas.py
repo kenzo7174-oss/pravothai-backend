@@ -56,6 +56,7 @@ class ConversationSchema(BaseModel):
     specialist_requested_at: Optional[datetime] = None
     pending_draft: Optional[str] = ""
     tags: Optional[str] = ""
+    has_new_contact: bool = False
     messages: list[MessageSchema] = []
 
 
