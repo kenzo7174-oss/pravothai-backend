@@ -260,6 +260,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE conversations ADD COLUMN tags VARCHAR(500) NOT NULL DEFAULT ''"
             ))
+        if "last_interaction_at" not in existing_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN last_interaction_at TIMESTAMP"
+            ))
 
         msg_columns = await _get_table_columns(conn, "messages")
 
@@ -396,6 +400,63 @@ async def sla_monitor_loop() -> None:
             log.error("SLA monitor loop error: %s", e)
 
 
+AUTO_AI_RETURN_MINUTES = 15
+
+
+async def _auto_ai_return_loop() -> None:
+    """Фоновый цикл: автовозврат в режим ИИ (bot) через 15 минут инактива оператора."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            now = datetime.now(timezone.utc)
+            cutoff_naive = (now - timedelta(minutes=AUTO_AI_RETURN_MINUTES)).replace(tzinfo=None)
+
+            async with AsyncSessionLocal() as session:
+                r = await session.execute(
+                    select(Conversation)
+                    .where(
+                        Conversation.intercept_mode.in_(
+                            (INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR)
+                        ),
+                        Conversation.last_interaction_at.isnot(None),
+                        Conversation.last_interaction_at < cutoff_naive,
+                    )
+                )
+                inactive_convs = list(r.scalars().all())
+
+            for conv in inactive_convs:
+                try:
+                    async with AsyncSessionLocal() as session:
+                        c = await session.get(Conversation, conv.id)
+                        if not c or c.intercept_mode not in {
+                            INTERCEPT_MODE_MANUAL,
+                            INTERCEPT_MODE_SENIOR,
+                        }:
+                            continue
+                        c.intercept_mode = INTERCEPT_MODE_BOT
+                        c.pending_draft = ""
+                        c.pending_draft_message_id = None
+                        await session.commit()
+                        client_id = c.client_id
+                    async with AsyncSessionLocal() as session:
+                        result = await session.execute(
+                            select(Client)
+                            .where(Client.id == client_id)
+                            .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+                        )
+                        client = result.scalar_one_or_none()
+                        if client:
+                            client_data = ClientSchema.model_validate(client).model_dump(mode="json")
+                            await sse_manager.broadcast("client_updated", {"client": client_data})
+                    log.info("Auto AI return: conv_id=%s (15 min inactivity)", conv.id)
+                except Exception as e:
+                    log.error("Auto AI return error for conv %s: %s", conv.id, e)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Auto AI return loop error: %s", e)
+
+
 async def register_telegram_webhook_on_startup() -> None:
     """Если заданы TELEGRAM_BOT_TOKEN и WEBHOOK_DOMAIN — регистрирует webhook в Telegram API."""
     if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_WEBHOOK_PUBLIC_URL:
@@ -433,12 +494,18 @@ async def lifespan(app: FastAPI):
     await seed_default_operator()
     await register_telegram_webhook_on_startup()
     sla_task = asyncio.create_task(sla_monitor_loop())
+    auto_ai_task = asyncio.create_task(_auto_ai_return_loop())
     broadcast_scheduler_task = asyncio.create_task(_scheduled_broadcast_loop())
     log.info("FastAPI startup complete")
     yield
     broadcast_scheduler_task.cancel()
     try:
         await broadcast_scheduler_task
+    except asyncio.CancelledError:
+        pass
+    auto_ai_task.cancel()
+    try:
+        await auto_ai_task
     except asyncio.CancelledError:
         pass
     sla_task.cancel()
@@ -725,6 +792,7 @@ async def create_message(
         conv.pending_draft_message_id = None
         conv.specialist_requested = False
 
+    conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
     msg = Message(
         conversation_id=conversation_id,
         content=body.content,
@@ -832,6 +900,9 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
         for conv in convs:
             try:
                 async with AsyncSessionLocal() as session:
+                    c = await session.get(Conversation, conv.id)
+                    if c:
+                        c.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
                     msg = Message(
                         conversation_id=conv.id,
                         content=personalized_text,
@@ -1072,6 +1143,7 @@ async def update_intercept_mode(
 
     # Оператор перехватил управление — сбрасываем флаг запроса специалиста
     if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+        conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         conv.specialist_requested = False
 
     # Скрытое системное сообщение при перехвате (видны только в Терминале)
@@ -1287,6 +1359,7 @@ async def telegram_webhook(
     else:
         client = await session.get(Client, conv.client_id)
 
+    conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
     # ── Сохраняем входящее сообщение ─────────────────────────────────────
     msg = Message(
         conversation_id=conv.id,
@@ -1615,6 +1688,7 @@ async def web_widget_webhook(
         session.add(conv)
         await session.flush()
 
+    conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
     msg = Message(
         conversation_id=conv.id,
         content=text,
@@ -1662,6 +1736,7 @@ async def web_widget_webhook(
         conv.specialist_requested_at = datetime.utcnow()
 
     if draft:
+        conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         ai_msg = Message(
             conversation_id=conv.id,
             content=draft,
