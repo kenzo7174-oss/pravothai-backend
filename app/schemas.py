@@ -3,7 +3,11 @@ Axoloti Terminal — Pydantic-схемы для сериализации дан�
 
 Эти схемы превращают ORM-объекты (Client, Conversation, Message)
 в красивый, типизированный JSON для фронтенда.
+
+ВАЖНО: Не импортировать из app.models — это создаёт циклический импорт.
+Схемы работают через model_validate(obj) и from_attributes=True.
 """
+from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional, Union
