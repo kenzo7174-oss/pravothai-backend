@@ -7,7 +7,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -102,6 +102,7 @@ async def process_incoming_client_message(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
+        conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         try:
             await session.commit()
             await session.refresh(ai_message)
