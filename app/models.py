@@ -1,182 +1,182 @@
 """
-Axoloti Terminal — ORM-модели омниканальной CRM.
+Axoloti Terminal — Pydantic-схемы для сериализации данных в JSON.
+
+Эти схемы превращают ORM-объекты (Client, Conversation, Message)
+в красивый, типизированный JSON для фронтенда.
 """
 
 from datetime import datetime
-from typing import List
-
-from sqlalchemy import (
-    Integer,
-    String,
-    Text,
-    Boolean,
-    DateTime,
-    ForeignKey,
-    JSON,
-)
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-
-from app.core.database import Base
+from typing import Optional, Union
+from pydantic import BaseModel, ConfigDict, field_validator
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  OPERATOR — Оператор (JWT-аутентификация)
-# ═══════════════════════════════════════════════════════════════════════════
-class Operator(Base):
-    __tablename__ = "operators"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
-    hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
-
-    def __repr__(self) -> str:
-        return f"<Operator #{self.id} {self.username}>"
+class LoginRequest(BaseModel):
+    """Запрос на вход оператора."""
+    username: str
+    password: str
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CLIENT — Карточка клиента
-# ═══════════════════════════════════════════════════════════════════════════
-class Client(Base):
-    __tablename__ = "clients"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    name: Mapped[str] = mapped_column(String(120), nullable=False)  # Глобальное имя (оператор меняет вручную)
-    original_name: Mapped[str] = mapped_column(String(120), default="")  # Имя из мессенджера или "Посетитель #X"
-    avatar: Mapped[str] = mapped_column(String(500), default="")
-    
-    # 🟢 КОНТАКТЫ И ПРОФИЛЬ (Добавлены новые поля)
-    phone: Mapped[str] = mapped_column(String(50), index=True, default="")
-    email: Mapped[str] = mapped_column(String(255), index=True, default="")
-    social_link: Mapped[str] = mapped_column(String(500), default="")   # vk/t.me/instagram/сайт (глобус)
-    location: Mapped[str] = mapped_column(String(255), default="")       # Город/Страна
-    website: Mapped[str] = mapped_column(String(255), default="")        # Сайт/Соцсеть (legacy)
-    device_info: Mapped[str] = mapped_column(String(255), default="")    # Данные системы (legacy)
-
-    # 🟢 ВЕБ-ВИДЖЕТ: склейка клиентов и техданные
-    axolotl_visitor_id: Mapped[str] = mapped_column(String(64), index=True, default="")
-    ip: Mapped[str] = mapped_column(String(45), default="")  # IPv4/IPv6
-    browser: Mapped[str] = mapped_column(String(64), default="")
-    os_device: Mapped[str] = mapped_column(String(128), default="")
-    
-    notes: Mapped[str] = mapped_column(Text, default="")
-    tags: Mapped[str] = mapped_column(String(500), default="")
-
-    # Управление списком
-    is_pinned: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
-
-    conversations: Mapped[List["Conversation"]] = relationship(
-        back_populates="client",
-        lazy="selectin",
-        cascade="all, delete-orphan",
-    )
-
-    def __repr__(self) -> str:
-        return f"<Client #{self.id} {self.name}>"
+class TokenResponse(BaseModel):
+    """JWT-токен после успешного входа."""
+    access_token: str
+    token_type: str = "bearer"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CONVERSATION — Диалог
-# ═══════════════════════════════════════════════════════════════════════════
-class Conversation(Base):
-    __tablename__ = "conversations"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    # Без ondelete="CASCADE" — при merge перепривязываем диалоги до удаления клиента
-    client_id: Mapped[int] = mapped_column(
-        ForeignKey("clients.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-
-    source: Mapped[str] = mapped_column(String(30), nullable=False)
-    social_id: Mapped[str] = mapped_column(String(120), default="")
-    label: Mapped[str] = mapped_column(String(255), default="")
-    original_name: Mapped[str] = mapped_column(String(120), default="")  # Имя для списка чатов (канал/канал)
-    intercept_mode: Mapped[str] = mapped_column(String(30), default="bot")
-    specialist_requested: Mapped[bool] = mapped_column(Boolean, default=False)
-    specialist_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    pending_draft: Mapped[str] = mapped_column(Text, default="")
-    pending_draft_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    last_ai_handled_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    tags: Mapped[str] = mapped_column(String(500), default="")
-    last_interaction_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    has_new_contact: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    messages: Mapped[List["Message"]] = relationship(
-        back_populates="conversation",
-        lazy="selectin",
-        cascade="all, delete-orphan",
-        order_by="Message.created_at",
-    )
-
-    client: Mapped["Client"] = relationship(back_populates="conversations")
+class MessageCreate(BaseModel):
+    """Входящий запрос на создание сообщения."""
+    content: str
+    sender: str
+    is_system: Optional[bool] = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  MESSAGE — Сообщение
-# ═══════════════════════════════════════════════════════════════════════════
-class Message(Base):
-    __tablename__ = "messages"
+class MessageSchema(BaseModel):
+    """Одно сообщение в диалоге."""
+    model_config = ConfigDict(from_attributes=True)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    conversation_id: Mapped[int] = mapped_column(ForeignKey("conversations.id"), nullable=False)
-
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    sender: Mapped[str] = mapped_column(String(20), nullable=False)
-    
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime,
-        default=datetime.utcnow,
-    )
-    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
-
-    conversation: Mapped["Conversation"] = relationship(back_populates="messages")
+    id: int
+    content: str
+    sender: str          # client / bot / operator / system
+    created_at: datetime
+    is_read: bool
+    is_voice: bool = False
+    is_internal: bool = False
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SYSTEM SETTINGS — Singleton (всегда одна запись id=1)
-# ═══════════════════════════════════════════════════════════════════════════
-DEFAULT_SENIOR_WELCOME_MESSAGE = "К диалогу подключился старший специалист."
+class ConversationSchema(BaseModel):
+    """Диалог в конкретном канале (Telegram, WhatsApp, Site)."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    source: str          # telegram / whatsapp / site
+    social_id: str
+    label: str
+    original_name: str = ""  # Имя для списка чатов (канал-специфичное)
+    intercept_mode: str = "bot"
+    specialist_requested: bool = False
+    specialist_requested_at: Optional[datetime] = None
+    pending_draft: Optional[str] = ""
+    tags: Optional[str] = ""
+    has_new_contact: bool = False
+    messages: list[MessageSchema] = []
 
 
-class SystemSettings(Base):
-    """Системные настройки приложения. Singleton: всегда одна запись с id=1."""
-    __tablename__ = "system_settings"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
-    senior_welcome_message: Mapped[str] = mapped_column(
-        String(500),
-        default=DEFAULT_SENIOR_WELCOME_MESSAGE,
-        nullable=False,
-    )
-    business_hours_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    business_start: Mapped[str] = mapped_column(String(10), default="09:00")
-    business_end: Mapped[str] = mapped_column(String(10), default="18:00")
-    operator_sla_minutes: Mapped[int] = mapped_column(Integer, default=5)
-
-    def __repr__(self) -> str:
-        return f"<SystemSettings id={self.id}>"
+class ConversationUpdate(BaseModel):
+    """Частичное обновление диалога."""
+    tags: Optional[str] = None
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SCHEDULED BROADCAST — Отложенная рассылка
-# ═══════════════════════════════════════════════════════════════════════════
-class ScheduledBroadcast(Base):
-    """Запланированная рассылка (отложенная по времени)."""
-    __tablename__ = "scheduled_broadcasts"
+class InterceptModeUpdate(BaseModel):
+    """Обновление серверного режима перехвата."""
+    mode: str
+    device_id: Optional[str] = None
+    operator_name: Optional[str] = None
+    operator_role: Optional[str] = None
+    operator_os: Optional[str] = None
+    senior_welcome_message: Optional[str] = None
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    recipients: Mapped[list] = mapped_column("client_ids", JSON, nullable=False)  # [{"client_id": 1, "source": "telegram"}, ...]; legacy: [1,2,3]
-    scheduled_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)  # UTC
-    is_sent: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    def __repr__(self) -> str:
-        return f"<ScheduledBroadcast #{self.id} at {self.scheduled_at}>"
+class SystemSettingsSchema(BaseModel):
+    """Системные настройки приложения."""
+    senior_welcome_message: str = "К диалогу подключился старший специалист."
+    business_hours_enabled: bool = False
+    business_start: str = "09:00"
+    business_end: str = "18:00"
+    operator_sla_minutes: int = 5
+
+
+class SystemSettingsUpdate(BaseModel):
+    """Частичное обновление системных настроек."""
+    senior_welcome_message: Optional[str] = None
+    business_hours_enabled: Optional[bool] = None
+    business_start: Optional[str] = None
+    business_end: Optional[str] = None
+    operator_sla_minutes: Optional[int] = None
+
+
+class ClientMergeRequest(BaseModel):
+    """Запрос на объединение клиента с другим."""
+    target_client_id: int
+
+
+class ClientUpdate(BaseModel):
+    """Частичное обновление карточки клиента. original_name не обновляется."""
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    social_link: Optional[str] = None
+    location: Optional[str] = None
+    ip: Optional[str] = None
+    website: Optional[str] = None
+    notes: Optional[str] = None
+    tags: Optional[Union[str, list[str]]] = None
+    browser: Optional[str] = None
+    os_device: Optional[str] = None
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _normalize_tags(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, list):
+            return ",".join(str(t).strip() for t in v if str(t).strip())
+        return v
+
+
+class BroadcastRecipient(BaseModel):
+    """Один получатель рассылки: клиент + канал."""
+    client_id: int
+    source: str  # telegram / web_widget / whatsapp / ...
+
+
+class BroadcastRequest(BaseModel):
+    """Запрос на запуск рассылки."""
+    text: str
+    recipients: list[BroadcastRecipient] = []  # список (client_id, source)
+    scheduled_at: Optional[datetime] = None  # ISO-строка или null = отправить сейчас
+
+
+class ScheduledBroadcastSchema(BaseModel):
+    """Запланированная рассылка (ответ API)."""
+    id: int
+    text: str
+    recipients: list[dict]  # [{client_id, source}, ...] или legacy [1,2,3]
+    scheduled_at: datetime
+    is_sent: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+    @field_validator("scheduled_at", mode="before")
+    @classmethod
+    def _parse_scheduled_at(cls, v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, datetime):
+            return v
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+        return None
+
+
+class ClientSchema(BaseModel):
+    """Карточка клиента со всеми диалогами."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    original_name: str = ""
+    avatar: str
+    phone: str
+    email: str
+    social_link: str = ""
+    location: str = ""
+    ip: str = ""
+    website: str = ""
+    device_info: str = ""
+    browser: str = ""
+    os_device: str = ""
+    notes: str
+    tags: str
+    conversations: list[ConversationSchema] = []
