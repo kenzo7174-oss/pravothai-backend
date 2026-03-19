@@ -8,6 +8,7 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 
 import asyncio
 import logging
+import random
 import re
 import uuid
 from contextlib import asynccontextmanager
@@ -299,6 +300,16 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE clients ADD COLUMN social_link VARCHAR(500) NOT NULL DEFAULT ''"
             ))
+        if "original_name" not in client_columns:
+            await conn.execute(text(
+                "ALTER TABLE clients ADD COLUMN original_name VARCHAR(120) NOT NULL DEFAULT ''"
+            ))
+
+        conv_columns = await _get_table_columns(conn, "conversations")
+        if "original_name" not in conv_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN original_name VARCHAR(120) NOT NULL DEFAULT ''"
+            ))
 
         # system_settings (рабочие часы, SLA)
         ss_columns = await _get_table_columns(conn, "system_settings")
@@ -404,7 +415,7 @@ AUTO_AI_RETURN_MINUTES = 15
 
 
 async def _auto_ai_return_loop() -> None:
-    """Фоновый цикл: автовозврат в режим ИИ (bot) через 15 минут инактива оператора."""
+    """Фоновый цикл: автовозврат в режим ИИ (bot) через 15 минут бездействия оператора."""
     while True:
         await asyncio.sleep(60)
         try:
@@ -418,13 +429,11 @@ async def _auto_ai_return_loop() -> None:
                         Conversation.intercept_mode.in_(
                             (INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR)
                         ),
-                        Conversation.last_interaction_at.isnot(None),
-                        Conversation.last_interaction_at < cutoff_naive,
                     )
                 )
-                inactive_convs = list(r.scalars().all())
+                manual_convs = list(r.scalars().all())
 
-            for conv in inactive_convs:
+            for conv in manual_convs:
                 try:
                     async with AsyncSessionLocal() as session:
                         c = await session.get(Conversation, conv.id)
@@ -433,6 +442,26 @@ async def _auto_ai_return_loop() -> None:
                             INTERCEPT_MODE_SENIOR,
                         }:
                             continue
+                        # Проверяем: оператор не писал 15 минут?
+                        r = await session.execute(
+                            select(Message)
+                            .where(
+                                Message.conversation_id == c.id,
+                                or_(
+                                    Message.sender == "operator",
+                                    and_(Message.sender == "system", Message.is_internal == True),
+                                ),
+                            )
+                            .order_by(Message.created_at.desc())
+                            .limit(1)
+                        )
+                        last_op = r.scalar_one_or_none()
+                        if last_op:
+                            msg_ts = last_op.created_at
+                            if msg_ts.tzinfo is None:
+                                msg_ts = msg_ts.replace(tzinfo=timezone.utc)
+                            if msg_ts >= (now - timedelta(minutes=AUTO_AI_RETURN_MINUTES)):
+                                continue  # оператор писал недавно — не возвращаем
                         c.intercept_mode = INTERCEPT_MODE_BOT
                         c.pending_draft = ""
                         c.pending_draft_message_id = None
@@ -1335,8 +1364,10 @@ async def telegram_webhook(
 
     if conv is None:
         # ── Новый клиент + диалог ────────────────────────────────────────
+        tg_original = f"@{username}" if username else full_name
         client = Client(
             name=full_name,
+            original_name=tg_original,
             avatar="",
             phone="",
             email="",
@@ -1352,7 +1383,8 @@ async def telegram_webhook(
             client_id=client.id,
             source="telegram",
             social_id=chat_id,
-            label=f"Telegram: {full_name}",
+            label=f"Telegram: {tg_original}",
+            original_name=tg_original,
         )
         session.add(conv)
         await session.flush()
@@ -1414,6 +1446,18 @@ def _get_client_ip(request: Request) -> str:
     if request.client:
         return request.client.host or ""
     return ""
+
+
+def _extract_city_for_visitor(location: str) -> str:
+    """Извлекает город из location для шаблона «Посетитель #X (город)». Если нет — «Инкогнито»."""
+    if not location or not location.strip():
+        return "Инкогнито"
+    loc = location.strip()
+    if loc in ("Сеть клиента", "Локальная сеть"):
+        return "Инкогнито"
+    if "," in loc:
+        return loc.split(",")[0].strip() or "Инкогнито"
+    return loc
 
 
 async def _fetch_geolocation(ip: str) -> str:
@@ -1624,10 +1668,13 @@ async def web_widget_webhook(
             client.os_device = os_device
         await session.flush()
     else:
-        # Клиент НЕ найден — создаём нового. Имя по умолчанию: «Посетитель (Ижевск)» или «Посетитель #ID»
-        default_name = f"Посетитель ({location})" if location else "Посетитель сайта"
+        # Клиент НЕ найден — создаём нового. Имя: «Посетитель #{random_id} ({city})»
+        city = _extract_city_for_visitor(location)
+        random_id = f"{random.randint(1000, 9999)}"
+        visitor_name = f"Посетитель #{random_id} ({city})"
         client = Client(
-            name=default_name,
+            name=visitor_name,
+            original_name=visitor_name,
             avatar="",
             phone="",
             email="",
@@ -1643,9 +1690,10 @@ async def web_widget_webhook(
         )
         session.add(client)
         await session.flush()
-        if client.name == "Посетитель сайта":
-            client.name = f"Посетитель #{client.id}"
-            await session.flush()
+        # Обновляем на последние 4 цифры ID для уникальности
+        client.name = f"Посетитель #{str(client.id)[-4:].zfill(4)} ({city})"
+        client.original_name = client.name
+        await session.flush()
 
     # Теперь ищем диалог для этого клиента
     thread_id_raw = body.get("thread_id")
@@ -1679,11 +1727,13 @@ async def web_widget_webhook(
 
     if conv is None:
         social_id = visitor_id or str(uuid.uuid4())
+        web_label = f"Web: {client.original_name or client.name}"
         conv = Conversation(
             client_id=client.id,
             source="web",
             social_id=social_id,
-            label="Web: Посетитель сайта",
+            label=web_label,
+            original_name=client.original_name or client.name,
         )
         session.add(conv)
         await session.flush()
@@ -1880,7 +1930,8 @@ async def detach_conversation(
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     new_client = Client(
-        name="Посетитель сайта",
+        name="Посетитель (Инкогнито)",
+        original_name="",
         avatar="",
         phone="",
         email="",
@@ -1897,9 +1948,12 @@ async def detach_conversation(
     await session.flush()
 
     conv.client_id = new_client.id
-    if new_client.name == "Посетитель сайта":
-        new_client.name = f"Посетитель #{new_client.id}"
-        await session.flush()
+    visitor_label = f"Посетитель #{str(new_client.id)[-4:].zfill(4)} (Инкогнито)"
+    new_client.name = visitor_label
+    new_client.original_name = visitor_label
+    conv.original_name = visitor_label
+    conv.label = f"Web: {visitor_label}"
+    await session.flush()
 
     await session.commit()
 
