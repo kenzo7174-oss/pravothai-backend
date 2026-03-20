@@ -32,6 +32,9 @@ VALID_INTERCEPT_MODES = frozenset({
     INTERCEPT_MODE_SENIOR,
 })
 
+# Короткая фраза перевода на специалиста (жёстко блокирует overtalking ИИ)
+AI_TRANSFER_PHRASE = "Перевожу на специалиста, одну минуту..."
+
 
 async def process_incoming_client_message(
     conversation_id: int,
@@ -62,7 +65,7 @@ async def process_incoming_client_message(
             return
 
         draft, request_operator = await generate_draft(recent_messages, session=session)
-        if not draft:
+        if not draft and not request_operator:
             log.warning(
                 "Не удалось сгенерировать ИИ-ответ для conversation_id=%s, mode=%s",
                 conversation_id,
@@ -70,35 +73,39 @@ async def process_incoming_client_message(
             )
             return
 
-        if mode == INTERCEPT_MODE_PROMPTER:
-            if request_operator:
-                conv.specialist_requested = True
-                conv.specialist_requested_at = datetime.utcnow()
+        # При вызове специалиста: СТРОГО короткая фраза, блокировка ИИ, статус "Требует внимания"
+        if request_operator:
+            content_to_send = AI_TRANSFER_PHRASE
+            conv.intercept_mode = INTERCEPT_MODE_MANUAL  # Жёстко блокируем ИИ
+            conv.specialist_requested = True
+            conv.specialist_requested_at = datetime.utcnow()
+            # Внутреннее системное сообщение (как при перехвате оператором)
+            internal_msg = Message(
+                conversation_id=conversation_id,
+                content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+                sender="system",
+                is_read=False,
+                is_voice=False,
+                is_internal=True,
+            )
+            session.add(internal_msg)
+        else:
+            content_to_send = draft
+
+        if mode == INTERCEPT_MODE_PROMPTER and not request_operator:
             conv.pending_draft = draft
             conv.pending_draft_message_id = message_id
             conv.last_ai_handled_message_id = message_id
             await session.commit()
-            if request_operator:
-                await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
             return
 
         ai_message = Message(
             conversation_id=conversation_id,
-            content=draft,
+            content=content_to_send,
             sender="assistant",
             is_read=False,
         )
         session.add(ai_message)
-        if request_operator:
-            system_msg = Message(
-                conversation_id=conversation_id,
-                content="Перевожу диалог на специалиста, пожалуйста, ожидайте.",
-                sender="system",
-                is_read=False,
-            )
-            session.add(system_msg)
-            conv.specialist_requested = True
-            conv.specialist_requested_at = datetime.utcnow()
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
         conv.last_ai_handled_message_id = message_id
@@ -107,7 +114,7 @@ async def process_incoming_client_message(
             await session.commit()
             await session.refresh(ai_message)
             if conv.source == "telegram" and conv.social_id:
-                ok = await send_telegram_message(conv.social_id, draft)
+                ok = await send_telegram_message(conv.social_id, content_to_send)
                 if not ok:
                     log.warning(
                         "ИИ-ответ сохранён, но не отправлен в Telegram (conv=%s, social_id=%s)",
