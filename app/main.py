@@ -55,6 +55,7 @@ from app.schemas import (
     TokenResponse,
 )
 from app.services.ai_dispatcher import (
+    AI_TRANSFER_PHRASE,
     INTERCEPT_MODE_BOT,
     INTERCEPT_MODE_PROMPTER,
     INTERCEPT_MODE_MANUAL,
@@ -1045,9 +1046,10 @@ async def delete_scheduled_broadcast(
 
 # Ключевые слова для определения запроса клиентом специалиста
 _SPECIALIST_REQUEST_PATTERNS = re.compile(
-    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|хочу\s+поговорить|соедините|позовите|позвать|поддержка|саппорт|админ|admin|техподдержка|свяжите)\b",
+    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|кожаный|хочу\s+поговорить|соедините|соедини|позовите|позови|позвать|поддержка|саппорт|админ|admin|техподдержка|свяжите)\b",
     re.IGNORECASE,
 )
+
 
 
 def _detect_specialist_request(text: str) -> bool:
@@ -1862,26 +1864,29 @@ async def web_widget_webhook(
     if request_operator:
         conv.specialist_requested = True
         conv.specialist_requested_at = datetime.utcnow()
+        conv.intercept_mode = INTERCEPT_MODE_MANUAL  # Жёстко блокируем ИИ
+        internal_msg = Message(
+            conversation_id=conv.id,
+            content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+            sender="system",
+            is_read=False,
+            is_voice=False,
+            is_internal=True,
+        )
+        session.add(internal_msg)
 
-    if draft:
+    content_to_reply = AI_TRANSFER_PHRASE if request_operator else (draft or "Извините, не удалось сформировать ответ. Попробуйте позже.")
+
+    if request_operator or draft:
         conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         ai_msg = Message(
             conversation_id=conv.id,
-            content=draft,
+            content=AI_TRANSFER_PHRASE if request_operator else draft,
             sender="bot",
             is_read=False,
             is_voice=False,
         )
         session.add(ai_msg)
-        if request_operator:
-            system_msg = Message(
-                conversation_id=conv.id,
-                content="Перевожу диалог на специалиста, пожалуйста, ожидайте.",
-                sender="system",
-                is_read=False,
-                is_voice=False,
-            )
-            session.add(system_msg)
         await session.commit()
         await session.refresh(ai_msg)
     elif request_operator:
@@ -1891,7 +1896,7 @@ async def web_widget_webhook(
         await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
 
     return {
-        "reply": draft or "Извините, не удалось сформировать ответ. Попробуйте позже.",
+        "reply": content_to_reply or "Извините, не удалось сформировать ответ. Попробуйте позже.",
         "thread_id": f"conv-{conv.id}",
     }
 
