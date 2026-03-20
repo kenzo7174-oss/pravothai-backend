@@ -55,7 +55,6 @@ from app.schemas import (
     TokenResponse,
 )
 from app.services.ai_dispatcher import (
-    AI_TRANSFER_PHRASE,
     INTERCEPT_MODE_BOT,
     INTERCEPT_MODE_PROMPTER,
     INTERCEPT_MODE_MANUAL,
@@ -1875,13 +1874,13 @@ async def web_widget_webhook(
         )
         session.add(internal_msg)
 
-    content_to_reply = AI_TRANSFER_PHRASE if request_operator else (draft or "Извините, не удалось сформировать ответ. Попробуйте позже.")
+    content_to_reply = "Перевожу на специалиста, одну минуту..." if request_operator else (draft or "Извините, не удалось сформировать ответ. Попробуйте позже.")
 
     if request_operator or draft:
         conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         ai_msg = Message(
             conversation_id=conv.id,
-            content=AI_TRANSFER_PHRASE if request_operator else draft,
+            content="Перевожу на специалиста, одну минуту..." if request_operator else draft,
             sender="bot",
             is_read=False,
             is_voice=False,
