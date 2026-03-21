@@ -106,6 +106,8 @@ class Conversation(Base):
     tags: Mapped[str] = mapped_column(String(500), default="")
     last_interaction_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     has_new_contact: Mapped[bool] = mapped_column(Boolean, default=False)
+    operator_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    operator_name: Mapped[str] = mapped_column(String(120), default="")
 
     messages: Mapped[List["Message"]] = relationship(
         back_populates="conversation",
