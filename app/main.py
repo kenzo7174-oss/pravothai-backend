@@ -1274,10 +1274,13 @@ async def update_intercept_mode(
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
 
-    # Оператор перехватил управление — сбрасываем флаг запроса специалиста, авто-назначаем если свободен
+    # Сброс флага вызова при любой ручной смене режима (manual, prompter, senior)
+    if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_PROMPTER, INTERCEPT_MODE_SENIOR}:
+        conv.specialist_requested = False
+
+    # Оператор перехватил управление — авто-назначаем если свободен
     if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
         conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
-        conv.specialist_requested = False
         if conv.operator_id is None:
             conv.operator_id = _operator.id
             conv.operator_name = (body.operator_name or "").strip() or _operator.username
@@ -1362,6 +1365,7 @@ async def assign_conversation(
     operator_name = (body.operator_name or "").strip() or _operator.username
     conv.operator_id = _operator.id
     conv.operator_name = operator_name
+    conv.specialist_requested = False
     await session.commit()
     await session.refresh(conv)
 
