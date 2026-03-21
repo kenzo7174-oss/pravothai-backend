@@ -93,11 +93,13 @@ async def process_incoming_client_message(
         else:
             content_to_send = draft
 
+        # В режиме prompter: сгенерированный текст ТОЛЬКО в pending_draft, никогда как готовое сообщение в чат
         if mode == INTERCEPT_MODE_PROMPTER and not request_operator:
             conv.pending_draft = draft
             conv.pending_draft_message_id = message_id
             conv.last_ai_handled_message_id = message_id
             await session.commit()
+            await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
             return
 
         ai_message = Message(
