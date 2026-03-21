@@ -853,11 +853,12 @@ async def create_message(
                 detail="Чат уже занят другим оператором",
             )
 
-    # Сброс pending_draft и specialist_requested ТОЛЬКО при ответе оператора (не bot/assistant/system)
-    if sender == "operator":
+    # Сброс pending_draft при любом ответе не от клиента (оператор или бот/суфлёр)
+    if sender != "client":
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
-        conv.specialist_requested = False
+        if sender == "operator":
+            conv.specialist_requested = False
 
     conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
     msg = Message(
@@ -1952,6 +1953,54 @@ async def web_widget_webhook(
                 "reply": "Ожидайте ответа оператора.",
                 "thread_id": f"conv-{conv.id}",
             }
+
+    # В режиме prompter: только черновик в pending_draft, НЕ создаём сообщение в чат
+    if conv.intercept_mode == INTERCEPT_MODE_PROMPTER:
+        result = await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.created_at.desc())
+            .limit(10)
+        )
+        recent = list(reversed(result.scalars().all()))
+        draft, request_operator = await generate_draft(recent, session=session)
+        if request_operator:
+            conv.specialist_requested = True
+            conv.specialist_requested_at = datetime.utcnow()
+            conv.intercept_mode = INTERCEPT_MODE_MANUAL
+            internal_msg = Message(
+                conversation_id=conv.id,
+                content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+                sender="system",
+                is_read=False,
+                is_voice=False,
+                is_internal=True,
+            )
+            session.add(internal_msg)
+            content_to_reply = "Перевожу вас на специалиста, одну минуту..."
+            ai_msg = Message(
+                conversation_id=conv.id,
+                content=content_to_reply,
+                sender="bot",
+                is_read=False,
+                is_voice=False,
+            )
+            session.add(ai_msg)
+            await session.commit()
+            await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+        elif draft:
+            conv.pending_draft = draft
+            conv.pending_draft_message_id = msg.id
+            conv.last_ai_handled_message_id = msg.id
+            await session.commit()
+            await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+            content_to_reply = "Ожидайте ответа оператора."
+        else:
+            content_to_reply = "Извините, не удалось сформировать ответ. Попробуйте позже."
+        return {
+            "reply": content_to_reply,
+            "thread_id": f"conv-{conv.id}",
+        }
 
     result = await session.execute(
         select(Message)
