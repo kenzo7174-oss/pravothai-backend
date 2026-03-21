@@ -44,7 +44,8 @@ async def process_incoming_client_message(
     async with AsyncSessionLocal() as session:
         conv = await session.get(Conversation, conversation_id)
         msg = await session.get(Message, message_id)
-        if not conv or not msg or msg.sender != "client":
+        # ЖЁСТКАЯ ПРОВЕРКА: ИИ реагирует ТОЛЬКО на сообщения клиентов
+        if not conv or not msg or msg.sender not in ("client",):
             return
 
         mode = conv.intercept_mode or INTERCEPT_MODE_BOT
@@ -93,7 +94,8 @@ async def process_incoming_client_message(
         else:
             content_to_send = draft
 
-        # В режиме prompter: сгенерированный текст ТОЛЬКО в pending_draft, никогда как готовое сообщение в чат
+        # В режиме prompter: сгенерированный текст ТОЛЬКО в pending_draft, никогда как готовое сообщение в чат.
+        # СТРОГО прерываем выполнение — ИИ не сохраняет черновик как сообщение в БД.
         if mode == INTERCEPT_MODE_PROMPTER and not request_operator:
             conv.pending_draft = draft
             conv.pending_draft_message_id = message_id
