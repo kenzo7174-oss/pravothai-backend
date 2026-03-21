@@ -853,6 +853,23 @@ async def create_message(
                 detail="Чат уже занят другим оператором",
             )
 
+    # Защита от дубликатов: если последнее сообщение с тем же текстом и sender создано недавно — 409
+    if sender != "client":
+        dup_window_sec = 5
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=dup_window_sec)).replace(tzinfo=None)
+        last_result = await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        last_msg = last_result.scalar_one_or_none()
+        if last_msg and last_msg.content == body.content and last_msg.sender == sender:
+            last_created = last_msg.created_at
+            last_naive = last_created.replace(tzinfo=None) if last_created and last_created.tzinfo else last_created
+            if last_naive and last_naive >= cutoff:
+                raise HTTPException(status_code=409, detail="Duplicate message")
+
     # Сброс pending_draft при любом ответе не от клиента (оператор или бот/суфлёр)
     if sender != "client":
         conv.pending_draft = ""
