@@ -33,7 +33,7 @@ VALID_INTERCEPT_MODES = frozenset({
 })
 
 # Короткая фраза перевода на специалиста (жёстко блокирует overtalking ИИ)
-AI_TRANSFER_PHRASE = "Перевожу на специалиста, одну минуту..."
+AI_TRANSFER_PHRASE = "Перевожу вас на специалиста, одну минуту..."
 
 
 async def process_incoming_client_message(
@@ -74,9 +74,10 @@ async def process_incoming_client_message(
             return
 
         # При вызове специалиста: СТРОГО короткая фраза, блокировка ИИ, статус "Требует внимания"
+        # Гарантия: права ИИ отзываются сразу — даже если он «захочет» написать ещё, доступ к чату уже закрыт
         if request_operator:
             content_to_send = AI_TRANSFER_PHRASE
-            conv.intercept_mode = INTERCEPT_MODE_MANUAL  # Жёстко блокируем ИИ
+            conv.intercept_mode = INTERCEPT_MODE_MANUAL  # is_ai_active = false
             conv.specialist_requested = True
             conv.specialist_requested_at = datetime.utcnow()
             # Внутреннее системное сообщение (как при перехвате оператором)
