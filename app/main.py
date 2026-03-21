@@ -315,6 +315,14 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 f"ALTER TABLE conversations ADD COLUMN has_new_contact BOOLEAN NOT NULL DEFAULT {default_bool}"
             ))
+        if "operator_id" not in conv_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN operator_id INTEGER"
+            ))
+        if "operator_name" not in conv_columns:
+            await conn.execute(text(
+                "ALTER TABLE conversations ADD COLUMN operator_name VARCHAR(120) NOT NULL DEFAULT ''"
+            ))
 
         # system_settings (рабочие часы, SLA)
         ss_columns = await _get_table_columns(conn, "system_settings")
@@ -367,6 +375,8 @@ async def sla_monitor_loop() -> None:
                         conv.intercept_mode = INTERCEPT_MODE_BOT
                         conv.pending_draft = ""
                         conv.pending_draft_message_id = None
+                        conv.operator_id = None
+                        conv.operator_name = ""
 
                         internal_msg = Message(
                             conversation_id=conv.id,
@@ -470,6 +480,8 @@ async def _auto_ai_return_loop() -> None:
                         c.intercept_mode = INTERCEPT_MODE_BOT
                         c.pending_draft = ""
                         c.pending_draft_message_id = None
+                        c.operator_id = None
+                        c.operator_name = ""
                         await session.commit()
                         client_id = c.client_id
                     async with AsyncSessionLocal() as session:
@@ -666,7 +678,19 @@ async def login(
         )
 
     token = create_access_token(subject=operator.username)
-    return TokenResponse(access_token=token)
+    return TokenResponse(
+        access_token=token,
+        operator_id=operator.id,
+        operator_username=operator.username,
+    )
+
+
+@app.get("/api/v1/auth/me")
+async def get_current_operator_info(
+    _operator: Operator = Depends(get_current_operator),
+):
+    """Возвращает данные текущего оператора (id, username)."""
+    return {"id": _operator.id, "username": _operator.username}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -803,11 +827,13 @@ async def get_client(
 async def create_message(
     conversation_id: int,
     body: MessageCreate,
+    _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Создаёт новое сообщение в диалоге и сохраняет в БД.
 
     Если диалог привязан к Telegram — параллельно пересылает текст клиенту.
+    Блокировка: при sender=operator проверяем, что чат назначен текущему оператору.
     """
     conv = await session.get(Conversation, conversation_id)
     if not conv:
@@ -819,6 +845,13 @@ async def create_message(
         sender = "operator"
     elif sender in ("assistant", "bot"):
         sender = "bot"
+
+    if sender == "operator":
+        if conv.operator_id is not None and conv.operator_id != _operator.id:
+            raise HTTPException(
+                status_code=403,
+                detail="Чат уже занят другим оператором",
+            )
 
     # Сброс pending_draft и specialist_requested ТОЛЬКО при ответе оператора (не bot/assistant/system)
     if sender == "operator":
@@ -1127,12 +1160,25 @@ async def _check_and_auto_wakeup_manual_mode(
         return False
 
     conv.intercept_mode = INTERCEPT_MODE_BOT
+    conv.operator_id = None
+    conv.operator_name = ""
     await session.commit()
+    client_id = conv.client_id
     log.info(
         "AUTO-WAKEUP: Client %s (conv %s) returned to AI mode (operator timeout)",
-        conv.client_id,
+        client_id,
         conv.id,
     )
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(Client)
+            .where(Client.id == client_id)
+            .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+        )
+        c = r.scalar_one_or_none()
+        if c:
+            client_data = ClientSchema.model_validate(c).model_dump(mode="json")
+            await sse_manager.broadcast("client_updated", {"client": client_data})
     return True
 
 
@@ -1201,23 +1247,37 @@ async def update_intercept_mode(
     При переключении на senior — отправляет клиенту системное сообщение (БД + Telegram).
     При переключении на manual — уведомлений нет (бесшовный перехват).
     При перехвате (bot -> manual/prompter/senior) создаёт скрытое системное сообщение (is_internal).
+    Блокировка: если чат занят другим оператором — 403.
     """
     conv = await session.get(Conversation, conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
+    if conv.operator_id is not None and conv.operator_id != _operator.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Чат уже занят другим оператором",
+        )
+
     prev_mode = conv.intercept_mode or INTERCEPT_MODE_BOT
     new_mode = _normalize_intercept_mode(body.mode)
     conv.intercept_mode = new_mode
+
+    if new_mode == INTERCEPT_MODE_BOT:
+        conv.operator_id = None
+        conv.operator_name = ""
 
     if conv.intercept_mode != INTERCEPT_MODE_PROMPTER:
         conv.pending_draft = ""
         conv.pending_draft_message_id = None
 
-    # Оператор перехватил управление — сбрасываем флаг запроса специалиста
+    # Оператор перехватил управление — сбрасываем флаг запроса специалиста, авто-назначаем если свободен
     if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
         conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
         conv.specialist_requested = False
+        if conv.operator_id is None:
+            conv.operator_id = _operator.id
+            conv.operator_name = (body.operator_name or "").strip() or _operator.username
 
     # Скрытое системное сообщение при перехвате (видны только в Терминале)
     if prev_mode == INTERCEPT_MODE_BOT and new_mode in {
@@ -1275,6 +1335,48 @@ async def update_intercept_mode(
         "conversation_id": conv.id,
         "intercept_mode": conv.intercept_mode,
         "pending_draft": conv.pending_draft,
+    }
+
+
+@app.post("/api/v1/conversations/{conversation_id}/assign")
+async def assign_conversation(
+    conversation_id: int,
+    body: InterceptModeUpdate,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Назначает диалог текущему оператору (Assign to me). Race condition: 403 если уже занят другим."""
+    conv = await session.get(Conversation, conversation_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    if conv.operator_id is not None and conv.operator_id != _operator.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Чат уже занят другим оператором",
+        )
+
+    operator_name = (body.operator_name or "").strip() or _operator.username
+    conv.operator_id = _operator.id
+    conv.operator_name = operator_name
+    await session.commit()
+    await session.refresh(conv)
+
+    async with AsyncSessionLocal() as s:
+        r = await s.execute(
+            select(Client)
+            .where(Client.id == conv.client_id)
+            .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+        )
+        c = r.scalar_one_or_none()
+        if c:
+            client_data = ClientSchema.model_validate(c).model_dump(mode="json")
+            await sse_manager.broadcast("client_updated", {"client": client_data})
+
+    return {
+        "conversation_id": conv.id,
+        "operator_id": conv.operator_id,
+        "operator_name": conv.operator_name,
     }
 
 
