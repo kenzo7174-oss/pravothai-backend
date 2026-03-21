@@ -1094,21 +1094,6 @@ async def delete_scheduled_broadcast(
     return {"status": "deleted", "message": "Рассылка отменена"}
 
 
-# Ключевые слова для определения запроса клиентом специалиста
-_SPECIALIST_REQUEST_PATTERNS = re.compile(
-    r"\b(специалист|оператор|менеджер|консультант|человек|живой|реальный|настоящий|кожаный|хочу\s+поговорить|соедините|соедини|позовите|позови|позвать|поддержка|саппорт|админ|admin|техподдержка|свяжите)\b",
-    re.IGNORECASE,
-)
-
-
-
-def _detect_specialist_request(text: str) -> bool:
-    """Проверяет, просит ли клиент специалиста/оператора."""
-    if not text or not isinstance(text, str):
-        return False
-    return bool(_SPECIALIST_REQUEST_PATTERNS.search(text.strip()))
-
-
 # Regex: телефон (10+ цифр, возможно с +) или email
 _CONTACT_PHONE_RE = re.compile(r"\+?\d[\d\s\-()]{9,}\d|\d{10,}")
 _CONTACT_EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -1571,13 +1556,6 @@ async def telegram_webhook(
     if client:
         await _apply_contacts_and_auto_merge(session, client, text)
 
-    # Клиент просит специалиста — устанавливаем флаг для уведомления оператора
-    if _detect_specialist_request(text) and conv.intercept_mode in {
-        INTERCEPT_MODE_BOT,
-        INTERCEPT_MODE_PROMPTER,
-    }:
-        conv.specialist_requested = True
-
     # Детектор контактов: телефон или email в сообщении
     if _detect_contact_in_text(text):
         conv.has_new_contact = True
@@ -1936,13 +1914,6 @@ async def web_widget_webhook(
     client = await session.get(Client, conv.client_id)
     if client:
         client = await _apply_contacts_and_auto_merge(session, client, text)
-
-    # Клиент просит специалиста — устанавливаем флаг для уведомления оператора
-    if _detect_specialist_request(text) and conv.intercept_mode in {
-        INTERCEPT_MODE_BOT,
-        INTERCEPT_MODE_PROMPTER,
-    }:
-        conv.specialist_requested = True
 
     # Детектор контактов: телефон или email в сообщении
     if _detect_contact_in_text(text):
