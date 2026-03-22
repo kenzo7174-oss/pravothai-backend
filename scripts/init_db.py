@@ -13,7 +13,17 @@ import asyncio
 from datetime import datetime, timedelta
 
 from app.core.database import engine, AsyncSessionLocal, Base
-from app.models import BroadcastHistory, Client, Conversation, Message, ScheduledBroadcast, SystemSettings, DEFAULT_SENIOR_WELCOME_MESSAGE
+from app.models import (
+    BroadcastHistory,
+    Client,
+    Conversation,
+    InviteToken,
+    Message,
+    Operator,
+    ScheduledBroadcast,
+    SystemSettings,
+    DEFAULT_SENIOR_WELCOME_MESSAGE,
+)
 
 
 # ── Вспомогательные временные метки ──────────────────────────────────────
