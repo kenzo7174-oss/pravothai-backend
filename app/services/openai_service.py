@@ -204,9 +204,14 @@ async def generate_draft(
         log.warning("OPENAI_RESPONSE_ID / OPENAI_ASSISTANT_ID не задан — генерация невозможна")
         return None, False
 
+    # ИИ реагирует ТОЛЬКО на сообщения клиента/оператора/бота. Системные — исключаем.
+    filtered = [m for m in messages if m.sender != "system"]
+    if not filtered:
+        log.warning("Нет сообщений для ИИ после исключения системных")
+        return None, False
     input_items = [
         {"role": SENDER_TO_ROLE.get(msg.sender, "user"), "content": msg.content}
-        for msg in messages
+        for msg in filtered
     ]
 
     instructions = SYSTEM_PROMPT
