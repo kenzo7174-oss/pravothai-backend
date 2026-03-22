@@ -9,9 +9,8 @@ import io
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
-from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI, APIError
 from sqlalchemy import select
@@ -189,21 +188,19 @@ def _is_within_business_hours(
 OFFLINE_REPLY_MESSAGE = "Сейчас нас нет на месте, но мы обязательно ответим в рабочее время."
 
 
-def _is_within_business_hours_tz(
-    business_start: str,
-    business_end: str,
-    tz: ZoneInfo | None = None,
-) -> bool:
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def _is_within_business_hours_msk(business_start: str, business_end: str) -> bool:
     """
-    Проверяет, попадает ли текущее время в интервал business_start - business_end.
-    tz: Europe/Samara (Ижевск) по умолчанию. None — local time сервера.
+    Проверяет, попадает ли текущее время (по МСК, UTC+3) в интервал business_start - business_end.
     """
     start_t = _parse_time(business_start)
     end_t = _parse_time(business_end)
     if not start_t or not end_t:
         return True
-    now = datetime.now(tz) if tz else datetime.now()
-    current_minutes = now.hour * 60 + now.minute
+    now_msk = datetime.now(MSK_TZ).time()
+    current_minutes = now_msk.hour * 60 + now_msk.minute
     start_minutes = start_t[0] * 60 + start_t[1]
     end_minutes = end_t[0] * 60 + end_t[1]
     if start_minutes <= end_minutes:
@@ -216,11 +213,11 @@ async def check_offline_block(
     conv,
 ) -> str | None:
     """
-    Проверка рабочих часов. Первый фильтр для входящих сообщений.
+    Проверка рабочих часов при эскалации на оператора.
 
-    1. Если у диалога уже есть оператор (conv.operator_id), возвращает None — не мешаем живому общению.
+    1. Если у диалога уже есть оператор (conv.operator_id), возвращает None.
     2. Берёт из SystemSettings: business_hours_enabled, business_start, business_end.
-    3. Если business_hours_enabled == True, проверяет текущее время в часовом поясе Europe/Samara (Ижевск).
+    3. Если business_hours_enabled == True, проверяет текущее время по МСК (UTC+3).
     4. Если время вне диапазона — возвращает текст автоответа. Иначе None.
     """
     if conv.operator_id is not None:
@@ -231,8 +228,7 @@ async def check_offline_block(
         return None
     start = getattr(ss, "business_start", "09:00") or "09:00"
     end = getattr(ss, "business_end", "18:00") or "18:00"
-    tz = ZoneInfo("Europe/Samara")  # Ижевск
-    if _is_within_business_hours_tz(start, end, tz):
+    if _is_within_business_hours_msk(start, end):
         return None
     return OFFLINE_REPLY_MESSAGE
 
