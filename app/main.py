@@ -1568,24 +1568,6 @@ async def telegram_webhook(
     await session.commit()
     await session.refresh(msg)
 
-    # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
-    # Исключение: operator_id задан — оператор ведёт диалог.
-    offline_msg = await check_offline_block(session, conv)
-    if offline_msg:
-        offline_bot = Message(
-            conversation_id=conv.id,
-            content=offline_msg,
-            sender="bot",
-            is_read=False,
-            is_voice=False,
-        )
-        session.add(offline_bot)
-        await session.commit()
-        if conv.source == "telegram" and conv.social_id:
-            await send_telegram_message(conv.social_id, offline_msg)
-        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
-        return {"ok": True}
-
     if conv.has_new_contact or conv.specialist_requested:
         async with AsyncSessionLocal() as s:
             r = await s.execute(
@@ -1945,22 +1927,6 @@ async def web_widget_webhook(
     await session.commit()
     await session.refresh(msg)
 
-    # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
-    # Исключение: operator_id задан — оператор ведёт диалог.
-    offline_msg = await check_offline_block(session, conv)
-    if offline_msg:
-        offline_bot = Message(
-            conversation_id=conv.id,
-            content=offline_msg,
-            sender="bot",
-            is_read=False,
-            is_voice=False,
-        )
-        session.add(offline_bot)
-        await session.commit()
-        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
-        return {"reply": offline_msg, "thread_id": f"conv-{conv.id}"}
-
     if conv.has_new_contact or conv.specialist_requested:
         async with AsyncSessionLocal() as s:
             r = await s.execute(
@@ -1992,29 +1958,44 @@ async def web_widget_webhook(
         recent = list(reversed(result.scalars().all()))
         draft, request_operator = await generate_draft(recent, session=session)
         if request_operator:
-            conv.specialist_requested = True
-            conv.specialist_requested_at = datetime.utcnow()
-            conv.intercept_mode = INTERCEPT_MODE_MANUAL
-            internal_msg = Message(
-                conversation_id=conv.id,
-                content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
-                sender="system",
-                is_read=False,
-                is_voice=False,
-                is_internal=True,
-            )
-            session.add(internal_msg)
-            content_to_reply = "Перевожу вас на специалиста, одну минуту..."
-            ai_msg = Message(
-                conversation_id=conv.id,
-                content=content_to_reply,
-                sender="bot",
-                is_read=False,
-                is_voice=False,
-            )
-            session.add(ai_msg)
-            await session.commit()
-            await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+            # Проверка рабочих часов при эскалации: нерабочее время — отменяем перевод, шлём офлайн-сообщение
+            offline_msg = await check_offline_block(session, conv)
+            if offline_msg:
+                content_to_reply = offline_msg
+                ai_msg = Message(
+                    conversation_id=conv.id,
+                    content=offline_msg,
+                    sender="bot",
+                    is_read=False,
+                    is_voice=False,
+                )
+                session.add(ai_msg)
+                await session.commit()
+                await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+            else:
+                conv.specialist_requested = True
+                conv.specialist_requested_at = datetime.utcnow()
+                conv.intercept_mode = INTERCEPT_MODE_MANUAL
+                internal_msg = Message(
+                    conversation_id=conv.id,
+                    content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
+                    sender="system",
+                    is_read=False,
+                    is_voice=False,
+                    is_internal=True,
+                )
+                session.add(internal_msg)
+                content_to_reply = "Перевожу вас на специалиста, одну минуту..."
+                ai_msg = Message(
+                    conversation_id=conv.id,
+                    content=content_to_reply,
+                    sender="bot",
+                    is_read=False,
+                    is_voice=False,
+                )
+                session.add(ai_msg)
+                await session.commit()
+                await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
         elif draft:
             conv.pending_draft = draft
             conv.pending_draft_message_id = msg.id
@@ -2037,6 +2018,13 @@ async def web_widget_webhook(
     )
     recent = list(reversed(result.scalars().all()))
     draft, request_operator = await generate_draft(recent, session=session)
+
+    # Проверка рабочих часов при эскалации: нерабочее время — отменяем перевод на оператора
+    if request_operator:
+        offline_msg = await check_offline_block(session, conv)
+        if offline_msg:
+            request_operator = False
+            draft = offline_msg
 
     if request_operator:
         conv.specialist_requested = True
