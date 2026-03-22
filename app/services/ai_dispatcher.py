@@ -14,7 +14,7 @@ from sqlalchemy import select
 from app.core.database import AsyncSessionLocal
 from app.core.sse import sse_manager
 from app.models import Conversation, Message
-from app.services.openai_service import generate_draft
+from app.services.openai_service import check_offline_block, generate_draft
 from app.services.telegram import send_telegram_message
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,26 @@ async def process_incoming_client_message(
         # ЖЁСТКАЯ ПРОВЕРКА: ИИ реагирует ТОЛЬКО на обычные сообщения клиентов.
         # Системные (sender=system), оператор, бот — не триггер для генерации ответа.
         if not conv or not msg or msg.sender != "client":
+            return
+
+        # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
+        # Исключение: operator_id задан — оператор ведёт диалог, не блокируем.
+        offline_msg = await check_offline_block(session, conv)
+        if offline_msg:
+            # Сохраняем автоответ в чат, отправляем клиенту, выходим без ИИ/очереди
+            ai_msg = Message(
+                conversation_id=conversation_id,
+                content=offline_msg,
+                sender="assistant",
+                is_read=False,
+            )
+            session.add(ai_msg)
+            try:
+                await session.commit()
+                if conv.source == "telegram" and conv.social_id:
+                    await send_telegram_message(conv.social_id, offline_msg)
+            except Exception as e:
+                log.error("Ошибка при сохранении офлайн-ответа: %s", e)
             return
 
         mode = conv.intercept_mode or INTERCEPT_MODE_BOT
