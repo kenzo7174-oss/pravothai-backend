@@ -63,7 +63,7 @@ from app.services.ai_dispatcher import (
     process_incoming_client_message,
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
-from app.services.openai_service import generate_draft, transcribe_voice
+from app.services.openai_service import check_offline_block, generate_draft, transcribe_voice
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
 from jose import JWTError, jwt
@@ -1568,6 +1568,24 @@ async def telegram_webhook(
     await session.commit()
     await session.refresh(msg)
 
+    # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
+    # Исключение: operator_id задан — оператор ведёт диалог.
+    offline_msg = await check_offline_block(session, conv)
+    if offline_msg:
+        offline_bot = Message(
+            conversation_id=conv.id,
+            content=offline_msg,
+            sender="bot",
+            is_read=False,
+            is_voice=False,
+        )
+        session.add(offline_bot)
+        await session.commit()
+        if conv.source == "telegram" and conv.social_id:
+            await send_telegram_message(conv.social_id, offline_msg)
+        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+        return {"ok": True}
+
     if conv.has_new_contact or conv.specialist_requested:
         async with AsyncSessionLocal() as s:
             r = await s.execute(
@@ -1926,6 +1944,22 @@ async def web_widget_webhook(
 
     await session.commit()
     await session.refresh(msg)
+
+    # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
+    # Исключение: operator_id задан — оператор ведёт диалог.
+    offline_msg = await check_offline_block(session, conv)
+    if offline_msg:
+        offline_bot = Message(
+            conversation_id=conv.id,
+            content=offline_msg,
+            sender="bot",
+            is_read=False,
+            is_voice=False,
+        )
+        session.add(offline_bot)
+        await session.commit()
+        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+        return {"reply": offline_msg, "thread_id": f"conv-{conv.id}"}
 
     if conv.has_new_contact or conv.specialist_requested:
         async with AsyncSessionLocal() as s:
