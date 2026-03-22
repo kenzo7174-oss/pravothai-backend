@@ -7,6 +7,7 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 """
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -1480,159 +1481,170 @@ async def generate_draft_endpoint(
 #  API v1 — Telegram Webhook
 # ═══════════════════════════════════════════════════════════════════════════
 
+
+async def process_telegram_task(update_data: dict) -> None:
+    """Фоновая обработка Telegram Update. Выполняется вне HTTP-запроса с собственной сессией БД.
+
+    Вся тяжёлая логика: парсинг, скачивание голоса, Whisper, БД, ИИ — выполняется здесь.
+    """
+    try:
+        tg_message = update_data.get("message") or update_data.get("edited_message")
+        if not tg_message:
+            return
+
+        text = tg_message.get("text")
+        is_voice = False
+
+        # Голосовое или аудио-сообщение → скачиваем и расшифровываем через Whisper
+        voice_obj = tg_message.get("voice") or tg_message.get("audio")
+        if not text and voice_obj:
+            file_id = voice_obj.get("file_id")
+            if file_id:
+                downloaded = await download_telegram_file(file_id)
+                if downloaded:
+                    audio_data, filename = downloaded
+                    transcription = await transcribe_voice(audio_data, filename)
+                    if transcription:
+                        text = transcription
+                        is_voice = True
+                    else:
+                        text = "[Голосовое сообщение — не удалось расшифровать]"
+                        is_voice = True
+                else:
+                    text = "[Голосовое сообщение — не удалось скачать]"
+                    is_voice = True
+            else:
+                text = "[Голосовое сообщение]"
+                is_voice = True
+
+        if not text:
+            return
+
+        chat = tg_message.get("chat", {})
+        chat_id = str(chat.get("id", ""))
+        first_name = (
+            tg_message.get("from", {}).get("first_name")
+            or chat.get("first_name")
+            or "Telegram User"
+        )
+        last_name = (
+            tg_message.get("from", {}).get("last_name")
+            or chat.get("last_name")
+            or ""
+        )
+        full_name = f"{first_name} {last_name}".strip()
+        username = tg_message.get("from", {}).get("username", "")
+
+        if not chat_id:
+            return
+
+        async with AsyncSessionLocal() as session:
+            # ── Ищем существующий диалог по social_id ────────────────────────────
+            result = await session.execute(
+                select(Conversation).where(
+                    Conversation.source == "telegram",
+                    Conversation.social_id == chat_id,
+                )
+            )
+            conv = result.scalar_one_or_none()
+
+            if conv is None:
+                # ── Новый клиент + диалог ────────────────────────────────────────
+                tg_original = f"@{username}" if username else full_name
+                client = Client(
+                    name=full_name,
+                    original_name=tg_original,
+                    avatar="",
+                    phone="",
+                    email="",
+                    social_link="",
+                    website=f"@{username}" if username else "",
+                    notes="",
+                    tags="telegram",
+                )
+                session.add(client)
+                await session.flush()
+
+                conv = Conversation(
+                    client_id=client.id,
+                    source="telegram",
+                    social_id=chat_id,
+                    label=f"Telegram: {tg_original}",
+                    original_name=tg_original,
+                )
+                session.add(conv)
+                await session.flush()
+            else:
+                client = await session.get(Client, conv.client_id)
+
+            conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
+            # ── Сохраняем входящее сообщение ─────────────────────────────────────
+            msg = Message(
+                conversation_id=conv.id,
+                content=text,
+                sender="client",
+                is_read=False,
+                is_voice=is_voice,
+            )
+            session.add(msg)
+            await session.flush()
+
+            # Извлечение контактов и авто-склейка с дублем по email/phone
+            if client:
+                await _apply_contacts_and_auto_merge(session, client, text)
+
+            # Детектор контактов: телефон или email в сообщении
+            if _detect_contact_in_text(text):
+                conv.has_new_contact = True
+
+            await session.commit()
+            await session.refresh(msg)
+
+            if conv.has_new_contact or conv.specialist_requested:
+                async with AsyncSessionLocal() as s:
+                    r = await s.execute(
+                        select(Client)
+                        .where(Client.id == conv.client_id)
+                        .options(selectinload(Client.conversations).selectinload(Conversation.messages))
+                    )
+                    c = r.scalar_one_or_none()
+                    if c:
+                        client_data = ClientSchema.model_validate(c).model_dump(mode="json")
+                        await sse_manager.broadcast("client_updated", {"client": client_data})
+
+            if conv.intercept_mode in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER}:
+                await process_incoming_client_message(conv.id, msg.id)
+            elif conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
+                did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
+                if did_wakeup:
+                    await process_incoming_client_message(conv.id, msg.id)
+    except Exception as exc:
+        log.exception("process_telegram_task error: %s", exc)
+
+
 @app.post("/api/v1/webhooks/telegram")
 async def telegram_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    session: AsyncSession = Depends(get_session),
 ):
     """Принимает Webhook-обновления от Telegram Bot API.
 
-    Поток:
-      1. Парсим Update → извлекаем chat_id, имя, текст.
-      2. Ищем Conversation по social_id == chat_id (source='telegram').
-      3. Если не нашли — создаём Client + Conversation.
-      4. Сохраняем входящее сообщение (sender='client').
+    Отвечает 200 OK мгновенно, чтобы Telegram не повторял запрос из-за таймаута.
+    Вся тяжёлая логика выполняется в фоне (process_telegram_task).
     """
     raw_body = await request.body()
     log.info("⚡ INCOMING TELEGRAM WEBHOOK: %s", raw_body.decode("utf-8", errors="replace"))
 
     try:
-        update = await request.json()
-    except Exception as e:
+        update_data = json.loads(raw_body)
+    except json.JSONDecodeError as e:
         log.warning("telegram_webhook invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    tg_message = update.get("message") or update.get("edited_message")
-    if not tg_message:
+    if not update_data.get("message") and not update_data.get("edited_message"):
         return {"ok": True}
 
-    text = tg_message.get("text")
-    is_voice = False
-
-    # Голосовое или аудио-сообщение → скачиваем и расшифровываем через Whisper
-    voice_obj = tg_message.get("voice") or tg_message.get("audio")
-    if not text and voice_obj:
-        file_id = voice_obj.get("file_id")
-        if file_id:
-            downloaded = await download_telegram_file(file_id)
-            if downloaded:
-                audio_data, filename = downloaded
-                transcription = await transcribe_voice(audio_data, filename)
-                if transcription:
-                    text = transcription
-                    is_voice = True
-                else:
-                    text = "[Голосовое сообщение — не удалось расшифровать]"
-                    is_voice = True
-            else:
-                text = "[Голосовое сообщение — не удалось скачать]"
-                is_voice = True
-        else:
-            text = "[Голосовое сообщение]"
-            is_voice = True
-
-    if not text:
-        return {"ok": True}
-
-    chat = tg_message.get("chat", {})
-    chat_id = str(chat.get("id", ""))
-    first_name = (
-        tg_message.get("from", {}).get("first_name")
-        or chat.get("first_name")
-        or "Telegram User"
-    )
-    last_name = (
-        tg_message.get("from", {}).get("last_name")
-        or chat.get("last_name")
-        or ""
-    )
-    full_name = f"{first_name} {last_name}".strip()
-    username = tg_message.get("from", {}).get("username", "")
-
-    if not chat_id:
-        raise HTTPException(status_code=400, detail="Missing chat.id")
-
-    # ── Ищем существующий диалог по social_id ────────────────────────────
-    result = await session.execute(
-        select(Conversation).where(
-            Conversation.source == "telegram",
-            Conversation.social_id == chat_id,
-        )
-    )
-    conv = result.scalar_one_or_none()
-
-    if conv is None:
-        # ── Новый клиент + диалог ────────────────────────────────────────
-        tg_original = f"@{username}" if username else full_name
-        client = Client(
-            name=full_name,
-            original_name=tg_original,
-            avatar="",
-            phone="",
-            email="",
-            social_link="",
-            website=f"@{username}" if username else "",
-            notes="",
-            tags="telegram",
-        )
-        session.add(client)
-        await session.flush()
-
-        conv = Conversation(
-            client_id=client.id,
-            source="telegram",
-            social_id=chat_id,
-            label=f"Telegram: {tg_original}",
-            original_name=tg_original,
-        )
-        session.add(conv)
-        await session.flush()
-    else:
-        client = await session.get(Client, conv.client_id)
-
-    conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    # ── Сохраняем входящее сообщение ─────────────────────────────────────
-    msg = Message(
-        conversation_id=conv.id,
-        content=text,
-        sender="client",
-        is_read=False,
-        is_voice=is_voice,
-    )
-    session.add(msg)
-    await session.flush()
-
-    # Извлечение контактов и авто-склейка с дублем по email/phone
-    if client:
-        await _apply_contacts_and_auto_merge(session, client, text)
-
-    # Детектор контактов: телефон или email в сообщении
-    if _detect_contact_in_text(text):
-        conv.has_new_contact = True
-
-    await session.commit()
-    await session.refresh(msg)
-
-    if conv.has_new_contact or conv.specialist_requested:
-        async with AsyncSessionLocal() as s:
-            r = await s.execute(
-                select(Client)
-                .where(Client.id == conv.client_id)
-                .options(selectinload(Client.conversations).selectinload(Conversation.messages))
-            )
-            c = r.scalar_one_or_none()
-            if c:
-                client_data = ClientSchema.model_validate(c).model_dump(mode="json")
-                await sse_manager.broadcast("client_updated", {"client": client_data})
-
-    if conv.intercept_mode in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER}:
-        background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
-    elif conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
-        did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
-        if did_wakeup:
-            background_tasks.add_task(process_incoming_client_message, conv.id, msg.id)
-
+    background_tasks.add_task(process_telegram_task, update_data)
     return {"ok": True}
 
 
