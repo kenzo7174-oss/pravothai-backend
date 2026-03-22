@@ -2,6 +2,7 @@
 Axoloti Terminal — ORM-модели омниканальной CRM.
 """
 
+import uuid
 from datetime import datetime
 from typing import List
 
@@ -182,3 +183,21 @@ class ScheduledBroadcast(Base):
 
     def __repr__(self) -> str:
         return f"<ScheduledBroadcast #{self.id} at {self.scheduled_at}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BROADCAST HISTORY — История отправленных рассылок
+# ═══════════════════════════════════════════════════════════════════════════
+class BroadcastHistory(Base):
+    """История выполненных рассылок."""
+    __tablename__ = "broadcast_history"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    message_text: Mapped[str] = mapped_column(Text, nullable=False)
+    channels: Mapped[list] = mapped_column(JSON, nullable=False)  # ["telegram", "web_widget", ...]
+    status: Mapped[str] = mapped_column(String(20), nullable=False)  # success / error
+    recipients_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<BroadcastHistory {self.id} status={self.status} recipients={self.recipients_count}>"
