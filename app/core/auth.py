@@ -41,6 +41,32 @@ def create_access_token(subject: str) -> str:
     )
 
 
+def create_setup_token(username: str) -> str:
+    """Краткосрочный токен для первичной установки пароля (5 мин)."""
+    expire = datetime.now(timezone.utc) + timedelta(minutes=5)
+    payload = {"sub": username, "purpose": "password_setup", "exp": expire}
+    return jwt.encode(
+        payload,
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+
+
+def decode_setup_token(token: str) -> str | None:
+    """Проверяет setup-токен и возвращает username или None."""
+    try:
+        payload = jwt.decode(
+            token,
+            settings.JWT_SECRET_KEY,
+            algorithms=[settings.JWT_ALGORITHM],
+        )
+        if payload.get("purpose") != "password_setup":
+            return None
+        return payload.get("sub")
+    except JWTError:
+        return None
+
+
 async def get_current_operator(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     session: AsyncSession = Depends(get_session),
@@ -75,5 +101,10 @@ async def get_current_operator(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Operator not found",
+        )
+    if not getattr(operator, "is_active", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещён",
         )
     return operator
