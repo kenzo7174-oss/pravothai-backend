@@ -31,6 +31,7 @@ from app.core.auth import (
     get_current_operator,
 )
 from app.models import (
+    BroadcastHistory,
     Client,
     Conversation,
     Message,
@@ -40,6 +41,7 @@ from app.models import (
     DEFAULT_SENIOR_WELCOME_MESSAGE,
 )
 from app.schemas import (
+    BroadcastHistorySchema,
     BroadcastRequest,
     ScheduledBroadcastSchema,
     ClientMergeRequest,
@@ -957,10 +959,16 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
     """
     Фоновая задача рассылки. recipients: [{client_id, source}, ...].
     source=None (legacy) = отправить во все каналы клиента.
+    По завершении сохраняет запись в BroadcastHistory.
     """
     if not recipients:
         return
     client_ids = list({r["client_id"] for r in recipients})
+    sources = [r.get("source") for r in recipients if r.get("source")]
+    channels_used = sorted(set(sources)) if sources else ["all"]
+
+    success_count = 0
+    has_error = False
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Client)
@@ -997,6 +1005,7 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
                     )
                     session.add(msg)
                     await session.commit()
+                    success_count += 1
 
                     if conv.source == "telegram" and conv.social_id:
                         ok = await send_telegram_message(conv.social_id, personalized_text)
@@ -1007,7 +1016,20 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
                             )
             except Exception as e:
                 log.error("Broadcast: ошибка отправки клиенту %s: %s", client.id, e)
+                has_error = True
             await asyncio.sleep(1)
+
+    # Сохраняем запись в историю рассылок
+    status = "error" if has_error else "success"
+    async with AsyncSessionLocal() as session:
+        bh = BroadcastHistory(
+            message_text=text,
+            channels=channels_used,
+            status=status,
+            recipients_count=success_count,
+        )
+        session.add(bh)
+        await session.commit()
 
 
 @app.post("/api/v1/broadcast")
@@ -1093,6 +1115,30 @@ async def delete_scheduled_broadcast(
         await session.delete(sb)
         await session.commit()
     return {"status": "deleted", "message": "Рассылка отменена"}
+
+
+@app.get("/api/v1/broadcasts/history", response_model=list[BroadcastHistorySchema])
+async def list_broadcast_history(
+    _: Operator = Depends(get_current_operator),
+):
+    """Список истории рассылок, отсортированный от новых к старым."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(BroadcastHistory)
+            .order_by(BroadcastHistory.created_at.desc())
+        )
+        rows = list(result.scalars().all())
+    return [
+        BroadcastHistorySchema(
+            id=r.id,
+            created_at=r.created_at.replace(tzinfo=timezone.utc) if r.created_at and r.created_at.tzinfo is None else r.created_at,
+            message_text=r.message_text,
+            channels=r.channels if isinstance(r.channels, list) else [],
+            status=r.status,
+            recipients_count=r.recipients_count,
+        )
+        for r in rows
+    ]
 
 
 # Regex: телефон (10+ цифр, возможно с +) или email
