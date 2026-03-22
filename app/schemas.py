@@ -164,6 +164,18 @@ class ScheduledBroadcastSchema(BaseModel):
         return None
 
 
+class BroadcastHistorySchema(BaseModel):
+    """Запись истории рассылки (ответ API)."""
+    id: str
+    created_at: datetime
+    message_text: str
+    channels: list[str]
+    status: str  # success / error
+    recipients_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class ClientSchema(BaseModel):
     """Карточка клиента со всеми диалогами."""
     model_config = ConfigDict(from_attributes=True)
