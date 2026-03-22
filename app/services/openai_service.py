@@ -184,6 +184,32 @@ def _is_within_business_hours(
     return current_minutes >= start_minutes or current_minutes <= end_minutes
 
 
+OFFLINE_REPLY_MESSAGE = "В данный момент операторов нет на месте, мы ответим вам в рабочее время."
+
+
+async def check_offline_block(
+    session: "AsyncSession",
+    conv,
+) -> str | None:
+    """
+    Проверка рабочих часов. Первый фильтр для входящих сообщений.
+    Если нерабочее время и оператор не назначен — возвращает текст автоответа.
+    Иначе None (обрабатывать как обычно).
+    Исключение: если operator_id задан — диалог ведёт оператор, блокировку не применяем.
+    """
+    if conv.operator_id is not None:
+        return None
+    result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
+    ss = result.scalar_one_or_none()
+    if not ss or not getattr(ss, "business_hours_enabled", False):
+        return None
+    start = getattr(ss, "business_start", "09:00") or "09:00"
+    end = getattr(ss, "business_end", "18:00") or "18:00"
+    if _is_within_business_hours(start, end):
+        return None
+    return OFFLINE_REPLY_MESSAGE
+
+
 async def generate_draft(
     messages: list[Message],
     session: "AsyncSession | None" = None,
