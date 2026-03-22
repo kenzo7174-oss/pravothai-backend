@@ -59,6 +59,7 @@ from app.services.ai_dispatcher import (
     INTERCEPT_MODE_PROMPTER,
     INTERCEPT_MODE_MANUAL,
     INTERCEPT_MODE_SENIOR,
+    get_intercept_mode_label_ru,
     process_incoming_client_message,
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
@@ -1297,7 +1298,7 @@ async def update_intercept_mode(
         operator_os = (body.operator_os or "").strip() or "—"
         internal_text = (
             f"{operator_name} ({operator_role}) • {operator_os} • {device_id} — "
-            f"перехватил управление. Режим: {new_mode}"
+            f"перехватил управление. Режим: {get_intercept_mode_label_ru(new_mode)}"
         )
         internal_msg = Message(
             conversation_id=conv.id,
@@ -1962,7 +1963,7 @@ async def web_widget_webhook(
             conv.intercept_mode = INTERCEPT_MODE_MANUAL
             internal_msg = Message(
                 conversation_id=conv.id,
-                content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+                content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
                 sender="system",
                 is_read=False,
                 is_voice=False,
@@ -2009,7 +2010,7 @@ async def web_widget_webhook(
         conv.intercept_mode = INTERCEPT_MODE_MANUAL  # Жёстко блокируем ИИ
         internal_msg = Message(
             conversation_id=conv.id,
-            content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+            content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
             sender="system",
             is_read=False,
             is_voice=False,
