@@ -32,6 +32,19 @@ VALID_INTERCEPT_MODES = frozenset({
     INTERCEPT_MODE_SENIOR,
 })
 
+# Русские названия режимов для системных сообщений (строчные)
+INTERCEPT_MODE_RU = {
+    INTERCEPT_MODE_PROMPTER: "суфлер",
+    INTERCEPT_MODE_MANUAL: "полный контроль",
+    INTERCEPT_MODE_SENIOR: "старший специалист",
+    "full_control": "полный контроль",
+}
+
+
+def get_intercept_mode_label_ru(mode: str) -> str:
+    """Возвращает русское название режима перехвата для отображения в системных сообщениях."""
+    return INTERCEPT_MODE_RU.get(mode, mode)
+
 # Короткая фраза перевода на специалиста (жёстко блокирует overtalking ИИ)
 AI_TRANSFER_PHRASE = "Перевожу вас на специалиста, одну минуту..."
 
@@ -84,7 +97,7 @@ async def process_incoming_client_message(
             # Внутреннее системное сообщение (как при перехвате оператором)
             internal_msg = Message(
                 conversation_id=conversation_id,
-                content="Система — перевёл на специалиста по запросу клиента. Режим: manual",
+                content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
                 sender="system",
                 is_read=False,
                 is_voice=False,
