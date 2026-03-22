@@ -62,26 +62,6 @@ async def process_incoming_client_message(
         if not conv or not msg or msg.sender != "client":
             return
 
-        # Проверка рабочих часов — ПЕРВЫЙ ФИЛЬТР. Нерабочее время → автоответ, return.
-        # Исключение: operator_id задан — оператор ведёт диалог, не блокируем.
-        offline_msg = await check_offline_block(session, conv)
-        if offline_msg:
-            # Сохраняем автоответ в чат, отправляем клиенту, выходим без ИИ/очереди
-            ai_msg = Message(
-                conversation_id=conversation_id,
-                content=offline_msg,
-                sender="assistant",
-                is_read=False,
-            )
-            session.add(ai_msg)
-            try:
-                await session.commit()
-                if conv.source == "telegram" and conv.social_id:
-                    await send_telegram_message(conv.social_id, offline_msg)
-            except Exception as e:
-                log.error("Ошибка при сохранении офлайн-ответа: %s", e)
-            return
-
         mode = conv.intercept_mode or INTERCEPT_MODE_BOT
         if mode not in {INTERCEPT_MODE_BOT, INTERCEPT_MODE_PROMPTER}:
             return
@@ -108,23 +88,28 @@ async def process_incoming_client_message(
             )
             return
 
-        # При вызове специалиста: СТРОГО короткая фраза, блокировка ИИ, статус "Требует внимания"
-        # Гарантия: права ИИ отзываются сразу — даже если он «захочет» написать ещё, доступ к чату уже закрыт
+        # При вызове специалиста: проверяем рабочие часы. Нерабочее время — отменяем эскалацию, шлём офлайн-сообщение.
         if request_operator:
-            content_to_send = AI_TRANSFER_PHRASE
-            conv.intercept_mode = INTERCEPT_MODE_MANUAL  # is_ai_active = false
-            conv.specialist_requested = True
-            conv.specialist_requested_at = datetime.utcnow()
-            # Внутреннее системное сообщение (как при перехвате оператором)
-            internal_msg = Message(
-                conversation_id=conversation_id,
-                content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
-                sender="system",
-                is_read=False,
-                is_voice=False,
-                is_internal=True,
-            )
-            session.add(internal_msg)
+            offline_msg = await check_offline_block(session, conv)
+            if offline_msg:
+                # Нерабочее время: не переводим на оператора, отправляем офлайн-ответ как обычный ответ бота
+                content_to_send = offline_msg
+                request_operator = False
+            else:
+                content_to_send = AI_TRANSFER_PHRASE
+                conv.intercept_mode = INTERCEPT_MODE_MANUAL  # is_ai_active = false
+                conv.specialist_requested = True
+                conv.specialist_requested_at = datetime.utcnow()
+                # Внутреннее системное сообщение (как при перехвате оператором)
+                internal_msg = Message(
+                    conversation_id=conversation_id,
+                    content=f"Система — перевёл на специалиста по запросу клиента. Режим: {get_intercept_mode_label_ru(INTERCEPT_MODE_MANUAL)}",
+                    sender="system",
+                    is_read=False,
+                    is_voice=False,
+                    is_internal=True,
+                )
+                session.add(internal_msg)
         else:
             content_to_send = draft
 
