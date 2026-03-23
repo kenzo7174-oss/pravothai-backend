@@ -49,6 +49,7 @@ from app.schemas import (
     BroadcastRequest,
     CheckLoginRequest,
     CheckLoginResponse,
+    OperatorProfileUpdate,
     OperatorSchema,
     ScheduledBroadcastSchema,
     ClientMergeRequest,
@@ -374,6 +375,10 @@ async def ensure_conversation_runtime_columns() -> None:
         if "full_name" not in op_columns:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN full_name VARCHAR(120)"
+            ))
+        if "job_title" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN job_title VARCHAR(120)"
             ))
         if "last_active" not in op_columns:
             await conn.execute(text(
@@ -931,7 +936,7 @@ async def get_current_operator_info(
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
-    """Возвращает данные текущего оператора (id, username, role). Обновляет last_active."""
+    """Возвращает данные текущего оператора (id, username, role, full_name, job_title). Обновляет last_active."""
     if hasattr(_operator, "last_active"):
         _operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
         await session.commit()
@@ -939,6 +944,30 @@ async def get_current_operator_info(
         "id": _operator.id,
         "username": _operator.username,
         "role": getattr(_operator, "role", "operator"),
+        "full_name": getattr(_operator, "full_name", None) or None,
+        "job_title": getattr(_operator, "job_title", None) or None,
+    }
+
+
+@app.put("/api/v1/operators/me")
+async def update_current_operator_profile(
+    body: OperatorProfileUpdate,
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Обновляет full_name и job_title только для текущего авторизованного оператора (current_user.id)."""
+    if body.full_name is not None:
+        _operator.full_name = (body.full_name or "").strip() or None
+    if body.job_title is not None:
+        _operator.job_title = (body.job_title or "").strip() or None
+    await session.commit()
+    await session.refresh(_operator)
+    return {
+        "id": _operator.id,
+        "username": _operator.username,
+        "role": getattr(_operator, "role", "operator"),
+        "full_name": getattr(_operator, "full_name", None) or None,
+        "job_title": getattr(_operator, "job_title", None) or None,
     }
 
 
@@ -977,6 +1006,7 @@ async def get_team(
             id=op.id,
             username=op.username,
             full_name=getattr(op, "full_name", None) or None,
+            job_title=getattr(op, "job_title", None) or None,
             role=getattr(op, "role", "operator"),
             is_active=getattr(op, "is_active", True),
             is_online=_is_online(op),
