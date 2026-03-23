@@ -16,12 +16,39 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class CheckLoginRequest(BaseModel):
+    """Запрос проверки логина (шаг 1)."""
+    username: str
+
+
+class CheckLoginResponse(BaseModel):
+    """Ответ проверки логина: существует ли пользователь и нужно ли установить пароль."""
+    exists: bool
+    needs_password_setup: bool
+    setup_token: Optional[str] = None
+
+
+class SetPasswordRequest(BaseModel):
+    """Запрос на первичную установку пароля."""
+    new_password: str
+    confirm_password: str
+
+
 class TokenResponse(BaseModel):
     """JWT-токен после успешного входа."""
     access_token: str
     token_type: str = "bearer"
     operator_id: Optional[int] = None
     operator_username: Optional[str] = None
+    operator_role: Optional[str] = None
+
+
+class OperatorSchema(BaseModel):
+    """Оператор для списка команды."""
+    id: int
+    username: str
+    role: str
+    is_active: bool
 
 
 class MessageCreate(BaseModel):
