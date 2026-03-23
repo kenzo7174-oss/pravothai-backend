@@ -564,18 +564,25 @@ async def seed_default_operator() -> None:
     """Create a default operator if the operators table is empty."""
     from app.core.database import AsyncSessionLocal
 
-    # Авто-миграция: добавить колонку link до любого запроса к operators
+    # Жёсткая проверка и создание колонок до любого создания сессии и select(Operator)
     async with engine.begin() as conn:
-        if is_postgres():
-            await conn.execute(text(
-                "ALTER TABLE operators ADD COLUMN IF NOT EXISTS link VARCHAR(500)"
-            ))
-        else:
+        if "sqlite" in str(engine.url):
             op_columns = await _get_table_columns(conn, "operators")
             if "link" not in op_columns:
                 await conn.execute(text(
                     "ALTER TABLE operators ADD COLUMN link VARCHAR(500)"
                 ))
+            if "job_title" not in op_columns:
+                await conn.execute(text(
+                    "ALTER TABLE operators ADD COLUMN job_title VARCHAR(120)"
+                ))
+        else:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN IF NOT EXISTS link VARCHAR(500)"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN IF NOT EXISTS job_title VARCHAR(120)"
+            ))
 
     owner_link = "https://axolotl-backend.onrender.com"
     owner_password = "123456"
