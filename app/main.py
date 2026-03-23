@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, or_, select, text
 from sqlalchemy.orm import selectinload
@@ -29,6 +30,8 @@ from app.core.auth import (
     hash_password,
     verify_password,
     create_access_token,
+    create_setup_token,
+    decode_setup_token,
     get_current_operator,
 )
 from app.models import (
@@ -44,6 +47,9 @@ from app.models import (
 from app.schemas import (
     BroadcastHistorySchema,
     BroadcastRequest,
+    CheckLoginRequest,
+    CheckLoginResponse,
+    OperatorSchema,
     ScheduledBroadcastSchema,
     ClientMergeRequest,
     ClientSchema,
@@ -53,6 +59,7 @@ from app.schemas import (
     LoginRequest,
     MessageCreate,
     MessageSchema,
+    SetPasswordRequest,
     SystemSettingsSchema,
     SystemSettingsUpdate,
     TokenResponse,
@@ -348,6 +355,23 @@ async def ensure_conversation_runtime_columns() -> None:
                 "ALTER TABLE system_settings ADD COLUMN operator_sla_minutes INTEGER NOT NULL DEFAULT 5"
             ))
 
+        # operators: role, is_active (система ролей Владелец/Оператор)
+        op_columns = await _get_table_columns(conn, "operators")
+        if "role" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN role VARCHAR(50) NOT NULL DEFAULT 'operator'"
+            ))
+        if "is_active" not in op_columns:
+            default_bool = "1" if not is_postgres() else "true"
+            await conn.execute(text(
+                f"ALTER TABLE operators ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT {default_bool}"
+            ))
+        if "needs_password_setup" not in op_columns:
+            default_bool = "0" if not is_postgres() else "false"
+            await conn.execute(text(
+                f"ALTER TABLE operators ADD COLUMN needs_password_setup BOOLEAN NOT NULL DEFAULT {default_bool}"
+            ))
+
 
 async def sla_monitor_loop() -> None:
     """Фоновый монитор: автовозврат ИИ при SLA-таймауте (оператор не ответил)."""
@@ -531,9 +555,34 @@ async def seed_default_operator() -> None:
             session.add(Operator(
                 username=username,
                 hashed_password=hash_password(password),
+                role="owner",
+                is_active=True,
             ))
             await session.commit()
-            log.info("Seeded default operator: %s", username)
+            log.info("Seeded default operator (owner): %s", username)
+
+
+async def ensure_first_operator_is_owner() -> None:
+    """Гарантирует, что первый оператор (или DEFAULT_ADMIN_USER) всегда имеет role=owner.
+    Критично для сохранения доступа после добавления системы ролей."""
+    from app.core.database import AsyncSessionLocal
+
+    async with AsyncSessionLocal() as session:
+        # Сначала ищем по DEFAULT_ADMIN_USER (чаще всего это admin)
+        result = await session.execute(
+            select(Operator).where(Operator.username == settings.DEFAULT_ADMIN_USER)
+        )
+        op = result.scalar_one_or_none()
+        if op is None:
+            # Если не найден — берём первого оператора в базе (самый старый)
+            result = await session.execute(select(Operator).order_by(Operator.id.asc()).limit(1))
+            op = result.scalar_one_or_none()
+        if op is not None and getattr(op, "role", None) != "owner":
+            op.role = "owner"
+            if hasattr(op, "is_active"):
+                op.is_active = True
+            await session.commit()
+            log.info("Ensured first operator is owner: id=%s username=%s", op.id, op.username)
 
 
 @asynccontextmanager
@@ -542,6 +591,7 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
     await ensure_conversation_runtime_columns()
     await seed_default_operator()
+    await ensure_first_operator_is_owner()
     await register_telegram_webhook_on_startup()
     sla_task = asyncio.create_task(sla_monitor_loop())
     auto_ai_task = asyncio.create_task(_auto_ai_return_loop())
@@ -664,6 +714,81 @@ async def sse_stream(
 #  API v1 — Аутентификация
 # ═══════════════════════════════════════════════════════════════════════════
 
+@app.post("/api/v1/auth/check-login", response_model=CheckLoginResponse)
+async def check_login(
+    body: CheckLoginRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """Проверка логина (шаг 1): существует ли пользователь и нужно ли установить пароль."""
+    result = await session.execute(
+        select(Operator).where(Operator.username == body.username)
+    )
+    operator = result.scalar_one_or_none()
+
+    if operator is None:
+        return CheckLoginResponse(exists=False, needs_password_setup=False)
+
+    if not getattr(operator, "is_active", True):
+        return CheckLoginResponse(exists=False, needs_password_setup=False)
+
+    needs_setup = getattr(operator, "needs_password_setup", False)
+    setup_token = None
+    if needs_setup:
+        setup_token = create_setup_token(operator.username)
+
+    return CheckLoginResponse(
+        exists=True,
+        needs_password_setup=needs_setup,
+        setup_token=setup_token,
+    )
+
+
+_setup_bearer = HTTPBearer(auto_error=True)
+
+
+async def _get_setup_username(
+    credentials: HTTPAuthorizationCredentials = Depends(_setup_bearer),
+) -> str:
+    """Извлекает username из setup-токена в Authorization."""
+    username = decode_setup_token(credentials.credentials)
+    if not username:
+        raise HTTPException(status_code=401, detail="Недействительный или истекший токен установки пароля")
+    return username
+
+
+@app.post("/api/v1/auth/set-password", response_model=TokenResponse)
+async def set_password(
+    body: SetPasswordRequest,
+    setup_username: str = Depends(_get_setup_username),
+    session: AsyncSession = Depends(get_session),
+):
+    """Первичная установка пароля. Требует setup_token из check-login в заголовке Authorization."""
+    if body.new_password != body.confirm_password:
+        raise HTTPException(status_code=400, detail="Пароли не совпадают")
+    if len(body.new_password) < 4:
+        raise HTTPException(status_code=400, detail="Пароль должен быть не менее 4 символов")
+
+    result = await session.execute(
+        select(Operator).where(Operator.username == setup_username)
+    )
+    operator = result.scalar_one_or_none()
+    if operator is None or not getattr(operator, "needs_password_setup", False):
+        raise HTTPException(status_code=400, detail="Установка пароля невозможна для этого пользователя")
+
+    operator.hashed_password = hash_password(body.new_password)
+    operator.needs_password_setup = False
+    await session.commit()
+    await session.refresh(operator)
+
+    token = create_access_token(subject=operator.username)
+    return TokenResponse(
+        access_token=token,
+        operator_id=operator.id,
+        operator_username=operator.username,
+        operator_role=getattr(operator, "role", "operator"),
+    )
+
+
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
@@ -681,11 +806,18 @@ async def login(
             detail="Неверное имя пользователя или пароль",
         )
 
+    if not getattr(operator, "is_active", True):
+        raise HTTPException(
+            status_code=403,
+            detail="Доступ запрещён",
+        )
+
     token = create_access_token(subject=operator.username)
     return TokenResponse(
         access_token=token,
         operator_id=operator.id,
         operator_username=operator.username,
+        operator_role=getattr(operator, "role", "operator"),
     )
 
 
@@ -693,8 +825,87 @@ async def login(
 async def get_current_operator_info(
     _operator: Operator = Depends(get_current_operator),
 ):
-    """Возвращает данные текущего оператора (id, username)."""
-    return {"id": _operator.id, "username": _operator.username}
+    """Возвращает данные текущего оператора (id, username, role)."""
+    return {
+        "id": _operator.id,
+        "username": _operator.username,
+        "role": getattr(_operator, "role", "operator"),
+    }
+
+
+def require_owner(_operator: Operator = Depends(get_current_operator)) -> Operator:
+    """Зависимость: только для владельца (role == 'owner')."""
+    if getattr(_operator, "role", "operator") != "owner":
+        raise HTTPException(status_code=403, detail="Доступ только для владельца")
+    return _operator
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  API v1 — Команда (только владелец)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/team", response_model=list[OperatorSchema])
+async def get_team(
+    _owner: Operator = Depends(require_owner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Список всех операторов. Только для role == 'owner'."""
+    result = await session.execute(select(Operator).order_by(Operator.id.asc()))
+    operators = list(result.scalars().all())
+    return [
+        OperatorSchema(
+            id=op.id,
+            username=op.username,
+            role=getattr(op, "role", "operator"),
+            is_active=getattr(op, "is_active", True),
+        )
+        for op in operators
+    ]
+
+
+@app.post("/api/v1/team/create")
+async def create_team_member(
+    _owner: Operator = Depends(require_owner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Создать нового оператора с уникальным логином ax-[4 символа]. needs_password_setup=True."""
+    import random
+    import string
+    chars = string.ascii_lowercase + string.digits
+    for _ in range(50):
+        suffix = "".join(random.choices(chars, k=4))
+        login = f"ax-{suffix}"
+        r = await session.execute(select(Operator).where(Operator.username == login))
+        if r.scalar_one_or_none() is None:
+            placeholder_hash = hash_password(str(uuid.uuid4()))
+            session.add(Operator(
+                username=login,
+                hashed_password=placeholder_hash,
+                role="operator",
+                is_active=True,
+                needs_password_setup=True,
+            ))
+            await session.commit()
+            return {"login": login}
+    raise HTTPException(status_code=500, detail="Не удалось сгенерировать уникальный логин")
+
+
+@app.patch("/api/v1/team/{user_id}/toggle")
+async def toggle_team_member(
+    user_id: int,
+    _owner: Operator = Depends(require_owner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Переключить is_active у оператора. Нельзя отключить владельца (себя)."""
+    if user_id == _owner.id:
+        raise HTTPException(status_code=400, detail="Нельзя отключить владельца")
+    result = await session.execute(select(Operator).where(Operator.id == user_id))
+    op = result.scalar_one_or_none()
+    if op is None:
+        raise HTTPException(status_code=404, detail="Оператор не найден")
+    op.is_active = not getattr(op, "is_active", True)
+    await session.commit()
+    return {"id": op.id, "is_active": op.is_active}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
