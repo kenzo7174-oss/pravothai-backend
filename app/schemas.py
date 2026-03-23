@@ -48,9 +48,16 @@ class OperatorSchema(BaseModel):
     id: int
     username: str
     full_name: Optional[str] = None
+    job_title: Optional[str] = None
     role: str
     is_active: bool
     is_online: bool = False
+
+
+class OperatorProfileUpdate(BaseModel):
+    """Обновление профиля текущего оператора (только свой ID)."""
+    full_name: Optional[str] = None
+    job_title: Optional[str] = None
 
 
 class MessageCreate(BaseModel):
