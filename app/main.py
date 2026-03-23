@@ -990,25 +990,29 @@ async def create_team_member(
     _owner: Operator = Depends(require_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Создать нового оператора с уникальным логином ax-[4 символа]. needs_password_setup=True."""
+    """Создать нового оператора с уникальным логином ax-[4 символа]. link = полная ссылка для входа."""
     import random
     import string
+
+    base_url = "https://axolotl-backend.onrender.com"
     chars = string.ascii_lowercase + string.digits
     for _ in range(50):
         suffix = "".join(random.choices(chars, k=4))
         login = f"ax-{suffix}"
         r = await session.execute(select(Operator).where(Operator.username == login))
         if r.scalar_one_or_none() is None:
+            full_link = f"{base_url.rstrip('/')}/{login}"
             placeholder_hash = hash_password(str(uuid.uuid4()))
             session.add(Operator(
                 username=login,
+                link=full_link,
                 hashed_password=placeholder_hash,
                 role="operator",
                 is_active=True,
                 needs_password_setup=True,
             ))
             await session.commit()
-            return {"login": login}
+            return {"login": login, "link": full_link}
     raise HTTPException(status_code=500, detail="Не удалось сгенерировать уникальный логин")
 
 
