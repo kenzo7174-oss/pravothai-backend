@@ -379,6 +379,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN last_active TIMESTAMP"
             ))
+        if "link" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN link VARCHAR(500)"
+            ))
 
 
 async def sla_monitor_loop() -> None:
@@ -555,19 +559,21 @@ async def seed_default_operator() -> None:
     """Create a default operator if the operators table is empty."""
     from app.core.database import AsyncSessionLocal
 
+    owner_link = "https://axolotl-backend.onrender.com"
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Operator).limit(1))
         if result.scalar_one_or_none() is None:
             username = settings.DEFAULT_ADMIN_USER
-            password = settings.DEFAULT_ADMIN_PASSWORD
+            password = "123456"
             session.add(Operator(
                 username=username,
+                link=owner_link,
                 hashed_password=hash_password(password),
                 role="owner",
                 is_active=True,
             ))
             await session.commit()
-            log.info("Seeded default operator (owner): %s", username)
+            log.info("Seeded default operator (owner): %s link=%s", username, owner_link)
 
 
 async def ensure_first_operator_is_owner() -> None:
@@ -756,9 +762,10 @@ async def check_login(
     session: AsyncSession = Depends(get_session),
 ):
     """Проверка ссылки (шаг 1): существует ли Владелец и нужно ли установить пароль."""
+    link = (body.link or "").strip()
     result = await session.execute(
         select(Operator).where(
-            Operator.username == body.link.strip(),
+            Operator.link == link,
             Operator.role.in_(("owner", "admin")),
         )
     )
@@ -839,11 +846,11 @@ async def login(
     body: LoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Аутентификация Владельца — поиск по ссылке (username), проверка пароля."""
+    """Аутентификация Владельца — поиск по полю link (URL бэкенда), проверка пароля."""
     link = (body.link or "").strip()
     result = await session.execute(
         select(Operator).where(
-            Operator.username == link,
+            Operator.link == link,
             Operator.role.in_(("owner", "admin")),
         )
     )
