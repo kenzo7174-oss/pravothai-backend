@@ -755,9 +755,12 @@ async def check_login(
     body: CheckLoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Проверка логина (шаг 1): существует ли пользователь и нужно ли установить пароль."""
+    """Проверка ссылки (шаг 1): существует ли Владелец и нужно ли установить пароль."""
     result = await session.execute(
-        select(Operator).where(Operator.username == body.username)
+        select(Operator).where(
+            Operator.username == body.link.strip(),
+            Operator.role.in_(("owner", "admin")),
+        )
     )
     operator = result.scalar_one_or_none()
 
@@ -836,16 +839,25 @@ async def login(
     body: LoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Аутентификация оператора — возвращает подписанный JWT."""
+    """Аутентификация Владельца — поиск по ссылке (username), проверка пароля."""
+    link = (body.link or "").strip()
     result = await session.execute(
-        select(Operator).where(Operator.username == body.username)
+        select(Operator).where(
+            Operator.username == link,
+            Operator.role.in_(("owner", "admin")),
+        )
     )
     operator = result.scalar_one_or_none()
 
-    if operator is None or not verify_password(body.password, operator.hashed_password):
+    if operator is None:
         raise HTTPException(
             status_code=401,
-            detail="Неверное имя пользователя или пароль",
+            detail="Неверная ссылка или пароль",
+        )
+    if not verify_password(body.password, operator.hashed_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Неверная ссылка или пароль",
         )
 
     is_active = getattr(operator, "is_active", True)
