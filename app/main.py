@@ -564,25 +564,53 @@ async def seed_default_operator() -> None:
 
 async def ensure_first_operator_is_owner() -> None:
     """Гарантирует, что первый оператор (или DEFAULT_ADMIN_USER) всегда имеет role=owner.
+    Обновляет NULL в новых колонках (is_active, needs_password_setup, role) у всех операторов.
     Критично для сохранения доступа после добавления системы ролей."""
     from app.core.database import AsyncSessionLocal
 
     async with AsyncSessionLocal() as session:
-        # Сначала ищем по DEFAULT_ADMIN_USER (чаще всего это admin)
-        result = await session.execute(
-            select(Operator).where(Operator.username == settings.DEFAULT_ADMIN_USER)
-        )
-        op = result.scalar_one_or_none()
-        if op is None:
-            # Если не найден — берём первого оператора в базе (самый старый)
-            result = await session.execute(select(Operator).order_by(Operator.id.asc()).limit(1))
-            op = result.scalar_one_or_none()
-        if op is not None and getattr(op, "role", None) != "owner":
-            op.role = "owner"
-            if hasattr(op, "is_active"):
+        result = await session.execute(select(Operator).order_by(Operator.id.asc()))
+        operators = list(result.scalars().all())
+        changed = False
+
+        for op in operators:
+            # 1. is_active IS NULL -> True
+            if getattr(op, "is_active", None) is None:
                 op.is_active = True
+                changed = True
+            # 2. needs_password_setup IS NULL -> False
+            if getattr(op, "needs_password_setup", None) is None:
+                op.needs_password_setup = False
+                changed = True
+            # 3. role IS NULL -> operator (потом перезапишем для admin)
+            if getattr(op, "role", None) is None:
+                op.role = "operator"
+                changed = True
+
+        # 4. Жёстко проставить owner для admin (или DEFAULT_ADMIN_USER)
+        default_admin = settings.DEFAULT_ADMIN_USER
+        for op in operators:
+            if op.username == default_admin:
+                if op.role != "owner" or not op.is_active or op.needs_password_setup:
+                    op.role = "owner"
+                    op.is_active = True
+                    op.needs_password_setup = False
+                    changed = True
+                    log.info("Ensured admin is owner: id=%s username=%s", op.id, op.username)
+                break
+        else:
+            # admin не найден — делаем первого оператора владельцем
+            if operators:
+                first = operators[0]
+                if first.role != "owner":
+                    first.role = "owner"
+                    first.is_active = True
+                    first.needs_password_setup = False
+                    changed = True
+                    log.info("Ensured first operator is owner: id=%s username=%s", first.id, first.username)
+
+        if changed:
             await session.commit()
-            log.info("Ensured first operator is owner: id=%s username=%s", op.id, op.username)
 
 
 @asynccontextmanager
@@ -728,10 +756,15 @@ async def check_login(
     if operator is None:
         return CheckLoginResponse(exists=False, needs_password_setup=False)
 
-    if not getattr(operator, "is_active", True):
+    is_active = getattr(operator, "is_active", True)
+    if is_active is None:
+        is_active = True  # fallback при NULL в БД
+    if not is_active:
         return CheckLoginResponse(exists=False, needs_password_setup=False)
 
     needs_setup = getattr(operator, "needs_password_setup", False)
+    if needs_setup is None:
+        needs_setup = False  # fallback при NULL в БД
     setup_token = None
     if needs_setup:
         setup_token = create_setup_token(operator.username)
@@ -806,7 +839,10 @@ async def login(
             detail="Неверное имя пользователя или пароль",
         )
 
-    if not getattr(operator, "is_active", True):
+    is_active = getattr(operator, "is_active", True)
+    if is_active is None:
+        is_active = True  # fallback при NULL в БД
+    if not is_active:
         raise HTTPException(
             status_code=403,
             detail="Доступ запрещён",
