@@ -28,6 +28,7 @@ class Operator(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     username: Mapped[str] = mapped_column(String(120), unique=True, nullable=False)
+    link: Mapped[str | None] = mapped_column(String(500), unique=True, nullable=True)  # URL бэкенда для идентификации Владельца
     hashed_password: Mapped[str] = mapped_column(String(255), nullable=False)
     full_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     role: Mapped[str] = mapped_column(String(50), default="operator", nullable=False)
