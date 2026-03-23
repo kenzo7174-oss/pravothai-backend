@@ -371,6 +371,14 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 f"ALTER TABLE operators ADD COLUMN needs_password_setup BOOLEAN NOT NULL DEFAULT {default_bool}"
             ))
+        if "full_name" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN full_name VARCHAR(120)"
+            ))
+        if "last_active" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN last_active TIMESTAMP"
+            ))
 
 
 async def sla_monitor_loop() -> None:
@@ -810,6 +818,7 @@ async def set_password(
 
     operator.hashed_password = hash_password(body.new_password)
     operator.needs_password_setup = False
+    operator.last_active = datetime.now(timezone.utc)
     await session.commit()
     await session.refresh(operator)
 
@@ -848,6 +857,9 @@ async def login(
             detail="Доступ запрещён",
         )
 
+    operator.last_active = datetime.now(timezone.utc)
+    await session.commit()
+
     token = create_access_token(subject=operator.username)
     return TokenResponse(
         access_token=token,
@@ -860,8 +872,12 @@ async def login(
 @app.get("/api/v1/auth/me")
 async def get_current_operator_info(
     _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
 ):
-    """Возвращает данные текущего оператора (id, username, role)."""
+    """Возвращает данные текущего оператора (id, username, role). Обновляет last_active."""
+    if hasattr(_operator, "last_active"):
+        _operator.last_active = datetime.now(timezone.utc)
+        await session.commit()
     return {
         "id": _operator.id,
         "username": _operator.username,
@@ -888,12 +904,25 @@ async def get_team(
     """Список всех операторов. Только для role == 'owner'."""
     result = await session.execute(select(Operator).order_by(Operator.id.asc()))
     operators = list(result.scalars().all())
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=5)
+
+    def _is_online(op) -> bool:
+        la = getattr(op, "last_active", None)
+        if la is None:
+            return False
+        if la.tzinfo is None:
+            la = la.replace(tzinfo=timezone.utc)
+        return la >= cutoff
+
     return [
         OperatorSchema(
             id=op.id,
             username=op.username,
+            full_name=getattr(op, "full_name", None) or None,
             role=getattr(op, "role", "operator"),
             is_active=getattr(op, "is_active", True),
+            is_online=_is_online(op),
         )
         for op in operators
     ]
@@ -942,6 +971,24 @@ async def toggle_team_member(
     op.is_active = not getattr(op, "is_active", True)
     await session.commit()
     return {"id": op.id, "is_active": op.is_active}
+
+
+@app.delete("/api/v1/team/{user_id}")
+async def delete_team_member(
+    user_id: int,
+    _owner: Operator = Depends(require_owner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Удалить оператора. Владелец не может удалить себя."""
+    if user_id == _owner.id:
+        raise HTTPException(status_code=400, detail="Нельзя удалить владельца")
+    result = await session.execute(select(Operator).where(Operator.id == user_id))
+    op = result.scalar_one_or_none()
+    if op is None:
+        raise HTTPException(status_code=404, detail="Оператор не найден")
+    await session.delete(op)
+    await session.commit()
+    return {"deleted": True}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
