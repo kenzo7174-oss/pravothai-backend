@@ -47,8 +47,10 @@ class OperatorSchema(BaseModel):
     """Оператор для списка команды."""
     id: int
     username: str
+    full_name: Optional[str] = None
     role: str
     is_active: bool
+    is_online: bool = False
 
 
 class MessageCreate(BaseModel):
