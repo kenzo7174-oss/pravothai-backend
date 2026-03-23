@@ -11,14 +11,14 @@ from pydantic import BaseModel, ConfigDict, field_validator
 
 
 class LoginRequest(BaseModel):
-    """Запрос на вход оператора."""
-    username: str
+    """Запрос на вход (Владелец по ссылке + пароль)."""
+    link: str
     password: str
 
 
 class CheckLoginRequest(BaseModel):
-    """Запрос проверки логина (шаг 1)."""
-    username: str
+    """Запрос проверки ссылки (шаг 1, опционально)."""
+    link: str
 
 
 class CheckLoginResponse(BaseModel):
