@@ -866,7 +866,7 @@ async def set_password(
 
     operator.hashed_password = hash_password(body.new_password)
     operator.needs_password_setup = False
-    operator.last_active = datetime.now(timezone.utc)
+    operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
     await session.commit()
     await session.refresh(operator)
 
@@ -914,7 +914,7 @@ async def login(
             detail="Доступ запрещён",
         )
 
-    operator.last_active = datetime.now(timezone.utc)
+    operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
     await session.commit()
 
     token = create_access_token(subject=operator.username)
@@ -933,7 +933,7 @@ async def get_current_operator_info(
 ):
     """Возвращает данные текущего оператора (id, username, role). Обновляет last_active."""
     if hasattr(_operator, "last_active"):
-        _operator.last_active = datetime.now(timezone.utc)
+        _operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
         await session.commit()
     return {
         "id": _operator.id,
