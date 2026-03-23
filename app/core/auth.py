@@ -102,7 +102,10 @@ async def get_current_operator(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Operator not found",
         )
-    if not getattr(operator, "is_active", True):
+    is_active = getattr(operator, "is_active", True)
+    if is_active is None:
+        is_active = True  # fallback при NULL в БД
+    if not is_active:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Доступ запрещён",
