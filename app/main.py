@@ -559,21 +559,59 @@ async def seed_default_operator() -> None:
     """Create a default operator if the operators table is empty."""
     from app.core.database import AsyncSessionLocal
 
+    # Авто-миграция: добавить колонку link до любого запроса к operators
+    async with engine.begin() as conn:
+        if is_postgres():
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN IF NOT EXISTS link VARCHAR(500)"
+            ))
+        else:
+            op_columns = await _get_table_columns(conn, "operators")
+            if "link" not in op_columns:
+                await conn.execute(text(
+                    "ALTER TABLE operators ADD COLUMN link VARCHAR(500)"
+                ))
+
     owner_link = "https://axolotl-backend.onrender.com"
+    owner_password = "123456"
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Operator).limit(1))
         if result.scalar_one_or_none() is None:
             username = settings.DEFAULT_ADMIN_USER
-            password = "123456"
             session.add(Operator(
                 username=username,
                 link=owner_link,
-                hashed_password=hash_password(password),
+                hashed_password=hash_password(owner_password),
                 role="owner",
                 is_active=True,
             ))
             await session.commit()
             log.info("Seeded default operator (owner): %s link=%s", username, owner_link)
+        else:
+            # Принудительно обновить link и пароль для главного Владельца
+            result = await session.execute(
+                select(Operator)
+                .where(
+                    or_(
+                        Operator.username == settings.DEFAULT_ADMIN_USER,
+                        Operator.role.in_(("owner", "admin")),
+                    )
+                )
+                .order_by(Operator.id.asc())
+                .limit(1)
+            )
+            admin = result.scalar_one_or_none()
+            if admin is None:
+                result = await session.execute(select(Operator).order_by(Operator.id.asc()).limit(1))
+                admin = result.scalar_one_or_none()
+            if admin:
+                admin.link = owner_link
+                admin.hashed_password = hash_password(owner_password)
+                admin.needs_password_setup = False
+                admin.role = "owner"
+                admin.is_active = True
+                await session.commit()
+                log.info("Updated owner link and password: %s link=%s", admin.username, owner_link)
 
 
 async def ensure_first_operator_is_owner() -> None:
