@@ -717,21 +717,15 @@ app = FastAPI(
 )
 
 # ── CORS (сразу после app, выше маршрутов) ─────────────────────────────────
-# Разрешаем виджет (axoloti.ru), фронтенд (localhost) и SSE.
 CORS_ORIGINS = [
-    "http://axoloti.ru",
-    "https://axoloti.ru",
-    "http://www.axoloti.ru",
-    "https://www.axoloti.ru",
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:5173",
-    "http://127.0.0.1:3000",
+    "https://app.axoloti.ru",
+    "https://axoloti-frontend.vercel.app",
+    "http://localhost:5173",  # локальная разработка
 ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["*"],
