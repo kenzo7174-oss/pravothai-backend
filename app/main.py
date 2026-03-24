@@ -720,7 +720,9 @@ app = FastAPI(
 CORS_ORIGINS = [
     "https://app.axoloti.ru",
     "https://axoloti-frontend.vercel.app",
-    "http://localhost:5173",  # локальная разработка
+    "https://axoloti.ru",       # виджет
+    "https://www.axoloti.ru",  # виджет
+    "http://localhost:5173",   # локальная разработка
 ]
 app.add_middleware(
     CORSMiddleware,
