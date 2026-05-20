@@ -809,13 +809,10 @@ async def check_login(
     body: CheckLoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Проверка ссылки (шаг 1): существует ли Владелец и нужно ли установить пароль."""
-    link = (body.link or "").strip()
+    """Проверка существования логина (шаг 1, опционально)."""
+    username = (body.username or "").strip()
     result = await session.execute(
-        select(Operator).where(
-            Operator.link == link,
-            Operator.role.in_(("owner", "admin")),
-        )
+        select(Operator).where(Operator.username == username)
     )
     operator = result.scalar_one_or_none()
 
@@ -824,22 +821,11 @@ async def check_login(
 
     is_active = getattr(operator, "is_active", True)
     if is_active is None:
-        is_active = True  # fallback при NULL в БД
+        is_active = True
     if not is_active:
         return CheckLoginResponse(exists=False, needs_password_setup=False)
 
-    needs_setup = getattr(operator, "needs_password_setup", False)
-    if needs_setup is None:
-        needs_setup = False  # fallback при NULL в БД
-    setup_token = None
-    if needs_setup:
-        setup_token = create_setup_token(operator.username)
-
-    return CheckLoginResponse(
-        exists=True,
-        needs_password_setup=needs_setup,
-        setup_token=setup_token,
-    )
+    return CheckLoginResponse(exists=True, needs_password_setup=False)
 
 
 _setup_bearer = HTTPBearer(auto_error=True)
@@ -894,30 +880,22 @@ async def login(
     body: LoginRequest,
     session: AsyncSession = Depends(get_session),
 ):
-    """Аутентификация Владельца — поиск по полю link (URL бэкенда), проверка пароля."""
-    link = (body.link or "").strip()
+    """Аутентификация по логину и паролю. Доступна для всех ролей."""
+    username = (body.username or "").strip()
     result = await session.execute(
-        select(Operator).where(
-            Operator.link == link,
-            Operator.role.in_(("owner", "admin")),
-        )
+        select(Operator).where(Operator.username == username)
     )
     operator = result.scalar_one_or_none()
 
-    if operator is None:
+    if operator is None or not verify_password(body.password, operator.hashed_password):
         raise HTTPException(
             status_code=401,
-            detail="Неверная ссылка или пароль",
-        )
-    if not verify_password(body.password, operator.hashed_password):
-        raise HTTPException(
-            status_code=401,
-            detail="Неверная ссылка или пароль",
+            detail="Неверный логин или пароль",
         )
 
     is_active = getattr(operator, "is_active", True)
     if is_active is None:
-        is_active = True  # fallback при NULL в БД
+        is_active = True
     if not is_active:
         raise HTTPException(
             status_code=403,
@@ -1025,29 +1003,28 @@ async def create_team_member(
     _owner: Operator = Depends(require_owner),
     session: AsyncSession = Depends(get_session),
 ):
-    """Создать нового оператора с уникальным логином ax-[4 символа]. link = полная ссылка для входа."""
+    """Создать нового оператора. Возвращает логин и пароль для передачи сотруднику."""
     import random
     import string
 
-    base_url = "https://axolotl-backend.onrender.com"
-    chars = string.ascii_lowercase + string.digits
+    username_chars = string.ascii_lowercase + string.digits
+    password_chars = string.ascii_letters + string.digits
     for _ in range(50):
-        suffix = "".join(random.choices(chars, k=4))
-        login = f"ax-{suffix}"
-        r = await session.execute(select(Operator).where(Operator.username == login))
+        suffix = "".join(random.choices(username_chars, k=6))
+        new_username = f"op_{suffix}"
+        r = await session.execute(select(Operator).where(Operator.username == new_username))
         if r.scalar_one_or_none() is None:
-            full_link = f"{base_url.rstrip('/')}/{login}"
-            placeholder_hash = hash_password(str(uuid.uuid4()))
+            plain_password = "".join(random.choices(password_chars, k=12))
             session.add(Operator(
-                username=login,
-                link=full_link,
-                hashed_password=placeholder_hash,
+                username=new_username,
+                link=None,
+                hashed_password=hash_password(plain_password),
                 role="operator",
                 is_active=True,
-                needs_password_setup=True,
+                needs_password_setup=False,
             ))
             await session.commit()
-            return {"login": login, "link": full_link}
+            return {"username": new_username, "password": plain_password}
     raise HTTPException(status_code=500, detail="Не удалось сгенерировать уникальный логин")
 
 
@@ -1119,7 +1096,7 @@ async def get_settings(
 @app.patch("/api/v1/settings", response_model=SystemSettingsSchema)
 async def patch_settings(
     body: SystemSettingsUpdate,
-    _operator: Operator = Depends(get_current_operator),
+    _operator: Operator = Depends(require_owner),
     session: AsyncSession = Depends(get_session),
 ):
     """Обновляет запись системных настроек (id=1)."""
