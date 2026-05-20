@@ -19,7 +19,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
@@ -1530,6 +1530,85 @@ async def list_broadcast_history(
         )
         for r in rows
     ]
+
+
+@app.get("/api/v1/analytics")
+async def get_analytics(
+    _: Operator = Depends(get_current_operator),
+):
+    """Аналитика: воронка обращений, эффективность ИИ, популярные теги."""
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = today_start - timedelta(days=today_start.weekday())
+
+    async with AsyncSessionLocal() as session:
+        # Все диалоги (теги и режим перехвата)
+        conv_result = await session.execute(
+            select(Conversation.id, Conversation.tags, Conversation.intercept_mode)
+        )
+        conversations = conv_result.all()
+
+        # Первое сообщение каждого диалога — дата создания обращения
+        first_msg_subq = (
+            select(
+                Message.conversation_id,
+                func.min(Message.created_at).label("first_at"),
+            )
+            .group_by(Message.conversation_id)
+            .subquery()
+        )
+        first_msg_result = await session.execute(
+            select(first_msg_subq.c.conversation_id, first_msg_subq.c.first_at)
+        )
+        first_msgs = first_msg_result.all()
+
+    # Воронка обращений
+    new_today = 0
+    new_week = 0
+    for row in first_msgs:
+        first_at = row.first_at
+        if first_at is None:
+            continue
+        if first_at.tzinfo is None:
+            first_at = first_at.replace(tzinfo=timezone.utc)
+        if first_at >= today_start:
+            new_today += 1
+        if first_at >= week_start:
+            new_week += 1
+
+    # Эффективность ИИ
+    ai_modes = {"bot", "ai_assistant"}
+    operator_modes = {"manual", "full_control", "senior", "prompter"}
+    ai_closed = sum(1 for c in conversations if c.intercept_mode in ai_modes)
+    operator_transferred = sum(1 for c in conversations if c.intercept_mode in operator_modes)
+
+    # Популярные теги
+    tag_counts: dict[str, int] = {}
+    for c in conversations:
+        if c.tags:
+            for tag in c.tags.split(","):
+                tag = tag.strip()
+                if tag:
+                    tag_counts[tag] = tag_counts.get(tag, 0) + 1
+
+    popular_tags = sorted(
+        [{"tag": k, "count": v} for k, v in tag_counts.items()],
+        key=lambda x: x["count"],
+        reverse=True,
+    )[:10]
+
+    return {
+        "funnel": {
+            "new_today": new_today,
+            "new_week": new_week,
+        },
+        "ai_efficiency": {
+            "ai_closed": ai_closed,
+            "operator_transferred": operator_transferred,
+            "total": len(conversations),
+        },
+        "popular_tags": popular_tags,
+    }
 
 
 # Regex: телефон (10+ цифр, возможно с +) или email
