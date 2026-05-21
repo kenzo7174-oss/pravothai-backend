@@ -911,6 +911,7 @@ async def login(
     operator.last_active = _now
     operator.last_login = _now
     await session.commit()
+    await session.refresh(operator)
 
     token = create_access_token(subject=operator.username)
     return TokenResponse(
@@ -1571,7 +1572,9 @@ async def get_analytics(
         # ── SLA: исторический расчёт по всем перехватам за 30 дней ─────────────
         # Берём все аудит-сообщения (is_internal) за 30 дней — даже для
         # архивированных диалогов, где operator_id уже обнулён.
-        # Оператор определяется парсингом логина из текста сообщения ([username]).
+        # Оператор определяется парсингом логина из текста: паттерн [username] (Роль).
+        # Старт таймера SLA: момент запроса клиента ("Перевожу вас на специалиста")
+        # если инициатором был клиент, иначе — аудит-лог перехвата.
         sla_data: list[dict] = []
 
         sla_internal_result = await session.execute(
@@ -1589,9 +1592,14 @@ async def get_analytics(
         )
         sla_internal_rows = sla_internal_result.all()
 
+        # Фильтруем только аудит-строки с реальным оператором (содержат паттерн [login] (Роль))
+        _AUDIT_RE = re.compile(r'\[([^\]]+)\]\s*\(')
+        sla_internal_rows = [r for r in sla_internal_rows if _AUDIT_RE.search(r.content or "")]
+
         sla_conv_ids_hist: set[int] = {r.conversation_id for r in sla_internal_rows}
 
         if sla_conv_ids_hist:
+            # Сообщения оператора (для определения времени ответа)
             sla_op_msgs_result = await session.execute(
                 select(
                     Message.conversation_id,
@@ -1605,6 +1613,23 @@ async def get_analytics(
             )
             sla_op_msgs_rows = sla_op_msgs_result.all()
 
+            # Публичные системные сообщения о переводе на специалиста (старт таймера клиента)
+            sla_transfer_result = await session.execute(
+                select(
+                    Message.conversation_id,
+                    Message.created_at,
+                )
+                .where(
+                    Message.conversation_id.in_(sla_conv_ids_hist),
+                    Message.sender.in_(["system", "bot"]),
+                    Message.is_internal == False,
+                    Message.content.like("%Перевожу вас на специалиста%"),
+                )
+                .order_by(Message.conversation_id, Message.created_at)
+            )
+            sla_transfer_rows = sla_transfer_result.all()
+
+            # Все операторы (без фильтра по роли — включает и owner, и operator)
             all_ops_result = await session.execute(
                 select(Operator.id, Operator.username, Operator.full_name)
             )
@@ -1614,24 +1639,32 @@ async def get_analytics(
             }
 
             def _parse_username_from_audit(content: str) -> str | None:
-                """Извлекает [username] из аудит-строки перехвата."""
-                m = re.search(r'\[([^\]\s]+)\]', content or "")
-                return m.group(1) if m else None
+                """Извлекает username из аудит-строки формата '... [username] (Роль) ...'."""
+                m = _AUDIT_RE.search(content or "")
+                return m.group(1).strip() if m else None
 
-            # Группируем operator-сообщения по диалогу
+            # Группируем по диалогу
             conv_to_op_msgs: dict[int, list] = defaultdict(list)
             for row in sla_op_msgs_rows:
                 conv_to_op_msgs[row.conversation_id].append(row)
 
-            # Считаем время реакции: intercept → первый ответ оператора
-            op_response_times_hist: dict[str, list[float]] = defaultdict(list)
+            conv_to_transfers: dict[int, list] = defaultdict(list)
+            for row in sla_transfer_rows:
+                conv_to_transfers[row.conversation_id].append(row)
+
             conv_to_internals: dict[int, list] = defaultdict(list)
             for row in sla_internal_rows:
                 conv_to_internals[row.conversation_id].append(row)
 
+            op_response_times_hist: dict[str, list[float]] = defaultdict(list)
+
             for conv_id, internals in conv_to_internals.items():
                 op_msgs = sorted(
                     conv_to_op_msgs.get(conv_id, []),
+                    key=lambda m: m.created_at or datetime.min,
+                )
+                transfers = sorted(
+                    conv_to_transfers.get(conv_id, []),
                     key=lambda m: m.created_at or datetime.min,
                 )
                 for internal in internals:
@@ -1643,6 +1676,21 @@ async def get_analytics(
                         continue
                     if i_at.tzinfo is None:
                         i_at = i_at.replace(tzinfo=timezone.utc)
+
+                    # Старт SLA: ищем «Перевожу вас на специалиста» до момента перехвата
+                    # в пределах 1 часа — значит, клиент инициировал запрос
+                    sla_start = i_at
+                    for transfer in reversed(transfers):
+                        t_at = transfer.created_at
+                        if t_at is None:
+                            continue
+                        if t_at.tzinfo is None:
+                            t_at = t_at.replace(tzinfo=timezone.utc)
+                        if t_at < i_at and (i_at - t_at).total_seconds() <= 3600:
+                            sla_start = t_at
+                            break
+
+                    # Первый ответ оператора после момента перехвата
                     for op_msg in op_msgs:
                         o_at = op_msg.created_at
                         if o_at is None:
@@ -1650,7 +1698,7 @@ async def get_analytics(
                         if o_at.tzinfo is None:
                             o_at = o_at.replace(tzinfo=timezone.utc)
                         if o_at > i_at:
-                            diff = (o_at - i_at).total_seconds()
+                            diff = (o_at - sla_start).total_seconds()
                             if 0 < diff < 7200:
                                 op_response_times_hist[username].append(diff)
                             break
