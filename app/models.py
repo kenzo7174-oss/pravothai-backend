@@ -36,6 +36,7 @@ class Operator(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     needs_password_setup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_active: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
         return f"<Operator #{self.id} {self.username}>"

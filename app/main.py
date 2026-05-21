@@ -384,6 +384,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN last_active TIMESTAMP"
             ))
+        if "last_login" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN last_login TIMESTAMP"
+            ))
         if "link" not in op_columns:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN link VARCHAR(500)"
@@ -902,7 +906,9 @@ async def login(
             detail="Доступ запрещён",
         )
 
-    operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
+    _now = datetime.now(timezone.utc).replace(tzinfo=None)
+    operator.last_active = _now
+    operator.last_login = _now
     await session.commit()
 
     token = create_access_token(subject=operator.username)
@@ -993,6 +999,7 @@ async def get_team(
             role=getattr(op, "role", "operator"),
             is_active=getattr(op, "is_active", True),
             is_online=_is_online(op),
+            last_login=getattr(op, "last_login", None),
         )
         for op in operators
     ]
@@ -1539,6 +1546,24 @@ async def get_analytics(
         )
         first_msgs = first_msg_result.all()
 
+        # Диалоги с участием оператора: хотя бы одно сообщение от оператора
+        # ИЛИ внутренний системный лог о перехвате управления
+        transferred_subq = (
+            select(Message.conversation_id)
+            .where(
+                or_(
+                    Message.sender == "operator",
+                    and_(Message.sender == "system", Message.is_internal == True),
+                )
+            )
+            .distinct()
+            .subquery()
+        )
+        transferred_count_result = await session.execute(
+            select(func.count()).select_from(transferred_subq)
+        )
+        operator_transferred = transferred_count_result.scalar() or 0
+
     # Воронка обращений
     new_today = 0
     new_week = 0
@@ -1555,9 +1580,7 @@ async def get_analytics(
 
     # Эффективность ИИ
     ai_modes = {"bot", "ai_assistant"}
-    operator_modes = {"manual", "full_control", "senior", "prompter"}
     ai_closed = sum(1 for c in conversations if c.intercept_mode in ai_modes)
-    operator_transferred = sum(1 for c in conversations if c.intercept_mode in operator_modes)
 
     # Популярные теги
     tag_counts: dict[str, int] = {}
@@ -1735,6 +1758,7 @@ async def clear_conversation_contact(
 async def update_intercept_mode(
     conversation_id: int,
     body: InterceptModeUpdate,
+    request: Request,
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
@@ -1785,13 +1809,19 @@ async def update_intercept_mode(
         INTERCEPT_MODE_MANUAL,
         INTERCEPT_MODE_SENIOR,
     }:
-        device_id = (body.device_id or "").strip() or "—"
-        operator_name = (body.operator_name or "").strip() or "Оператор"
-        operator_role = (body.operator_role or "").strip() or "Специалист"
-        operator_os = (body.operator_os or "").strip() or "—"
+        _ts = datetime.now(timezone.utc)
+        _time_str = _ts.strftime("%H:%M")
+        _login = _operator.username
+        _full_name = (getattr(_operator, "full_name", None) or "").strip()
+        _name_part = f"{_full_name} [{_login}]" if _full_name else f"[{_login}]"
+        _role_label = (body.operator_role or "").strip() or "Специалист"
+        _os = (body.operator_os or "").strip() or "—"
+        _ip = _get_client_ip(request) or "—"
+        _trigger = (body.trigger or "").strip() or "Инициатива оператора"
+        _mode_label = get_intercept_mode_label_ru(new_mode)
         internal_text = (
-            f"{operator_name} ({operator_role}) • {operator_os} • {device_id} — "
-            f"перехватил управление. Режим: {get_intercept_mode_label_ru(new_mode)}"
+            f"{_time_str} • {_name_part} ({_role_label}) • {_os} • "
+            f"IP: {_ip} • Триггер: {_trigger} • Режим: {_mode_label}"
         )
         internal_msg = Message(
             conversation_id=conv.id,

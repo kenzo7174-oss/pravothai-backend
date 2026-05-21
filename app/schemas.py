@@ -52,6 +52,7 @@ class OperatorSchema(BaseModel):
     role: str
     is_active: bool
     is_online: bool = False
+    last_login: Optional[datetime] = None
 
 
 class OperatorProfileUpdate(BaseModel):
@@ -113,6 +114,7 @@ class InterceptModeUpdate(BaseModel):
     operator_role: Optional[str] = None
     operator_os: Optional[str] = None
     senior_welcome_message: Optional[str] = None
+    trigger: Optional[str] = None
 
 
 class SystemSettingsSchema(BaseModel):
