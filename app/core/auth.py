@@ -74,6 +74,7 @@ async def get_current_operator(
     """FastAPI dependency — extracts and validates the JWT Bearer token.
 
     Returns the Operator ORM object or raises 401.
+    Updates last_active on every authenticated request so is_online stays accurate.
     """
     from app.models import Operator  # deferred to avoid circular import
 
@@ -110,4 +111,9 @@ async def get_current_operator(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Доступ запрещён",
         )
+
+    if hasattr(operator, "last_active"):
+        operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
+        await session.commit()
+
     return operator

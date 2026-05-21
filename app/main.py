@@ -926,10 +926,7 @@ async def get_current_operator_info(
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
-    """Возвращает данные текущего оператора (id, username, role, full_name, job_title). Обновляет last_active."""
-    if hasattr(_operator, "last_active"):
-        _operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
-        await session.commit()
+    """Возвращает данные текущего оператора (id, username, role, full_name, job_title)."""
     return {
         "id": _operator.id,
         "username": _operator.username,
