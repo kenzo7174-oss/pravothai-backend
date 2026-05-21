@@ -12,6 +12,7 @@ import logging
 import random
 import re
 import uuid
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -1520,19 +1521,20 @@ async def list_broadcast_history(
 async def get_analytics(
     _: Operator = Depends(get_current_operator),
 ):
-    """Аналитика: воронка обращений, эффективность ИИ, популярные теги."""
+    """Аналитика: воронка, ИИ-эффективность, теги, тепловая карта, узкие места, SLA, исходы."""
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = today_start - timedelta(days=today_start.weekday())
+    month_ago = (now - timedelta(days=30)).replace(tzinfo=None)
 
     async with AsyncSessionLocal() as session:
-        # Все диалоги (теги и режим перехвата)
+        # ── Все диалоги (теги, режим, operator_id) ──────────────────────────
         conv_result = await session.execute(
-            select(Conversation.id, Conversation.tags, Conversation.intercept_mode)
+            select(Conversation.id, Conversation.tags, Conversation.intercept_mode, Conversation.operator_id)
         )
         conversations = conv_result.all()
 
-        # Первое сообщение каждого диалога — дата создания обращения
+        # ── Первое сообщение каждого диалога (воронка) ───────────────────────
         first_msg_subq = (
             select(
                 Message.conversation_id,
@@ -1546,9 +1548,8 @@ async def get_analytics(
         )
         first_msgs = first_msg_result.all()
 
-        # Диалоги с участием оператора: хотя бы одно сообщение от оператора
-        # ИЛИ внутренний системный лог о перехвате управления
-        transferred_subq = (
+        # ── Диалоги с участием оператора (transferred + общий набор) ─────────
+        op_conv_result = await session.execute(
             select(Message.conversation_id)
             .where(
                 or_(
@@ -1557,14 +1558,114 @@ async def get_analytics(
                 )
             )
             .distinct()
-            .subquery()
         )
-        transferred_count_result = await session.execute(
-            select(func.count()).select_from(transferred_subq)
-        )
-        operator_transferred = transferred_count_result.scalar() or 0
+        op_conv_ids: set[int] = {row[0] for row in op_conv_result.all()}
 
-    # Воронка обращений
+        # ── Тепловая карта: клиентские сообщения за последние 30 дней ────────
+        heatmap_result = await session.execute(
+            select(Message.created_at)
+            .where(
+                Message.sender == "client",
+                Message.created_at >= month_ago,
+            )
+        )
+        heatmap_timestamps = heatmap_result.scalars().all()
+
+        # ── SLA: сообщения для диалогов с назначенным оператором ─────────────
+        sla_conv_map: dict[int, int] = {
+            c.id: c.operator_id for c in conversations if c.operator_id is not None
+        }
+        sla_data: list[dict] = []
+        if sla_conv_map:
+            sla_msgs_result = await session.execute(
+                select(
+                    Message.conversation_id,
+                    Message.sender,
+                    Message.is_internal,
+                    Message.created_at,
+                )
+                .where(
+                    Message.conversation_id.in_(list(sla_conv_map.keys())),
+                    or_(
+                        and_(Message.sender == "system", Message.is_internal == True),
+                        Message.sender == "operator",
+                    ),
+                )
+                .order_by(Message.conversation_id, Message.created_at)
+            )
+            sla_msgs_rows = sla_msgs_result.all()
+
+            op_ids_needed = list({v for v in sla_conv_map.values()})
+            ops_result = await session.execute(
+                select(Operator.id, Operator.username, Operator.full_name)
+                .where(Operator.id.in_(op_ids_needed))
+            )
+            operators_map: dict[int, dict] = {
+                row.id: {"username": row.username, "full_name": row.full_name}
+                for row in ops_result.all()
+            }
+
+            # Группируем сообщения по диалогу и считаем SLA
+            conv_to_sla_msgs: dict[int, list] = defaultdict(list)
+            for row in sla_msgs_rows:
+                conv_to_sla_msgs[row.conversation_id].append(row)
+
+            op_response_times: dict[int, list[float]] = defaultdict(list)
+            for conv_id, msgs in conv_to_sla_msgs.items():
+                op_id = sla_conv_map.get(conv_id)
+                if not op_id:
+                    continue
+                intercepts = sorted(
+                    [m for m in msgs if m.sender == "system" and m.is_internal],
+                    key=lambda m: m.created_at or datetime.min,
+                )
+                op_msgs = sorted(
+                    [m for m in msgs if m.sender == "operator"],
+                    key=lambda m: m.created_at or datetime.min,
+                )
+                for intercept in intercepts:
+                    i_at = intercept.created_at
+                    if i_at is None:
+                        continue
+                    if i_at.tzinfo is None:
+                        i_at = i_at.replace(tzinfo=timezone.utc)
+                    for op_msg in op_msgs:
+                        o_at = op_msg.created_at
+                        if o_at is None:
+                            continue
+                        if o_at.tzinfo is None:
+                            o_at = o_at.replace(tzinfo=timezone.utc)
+                        if o_at > i_at:
+                            diff = (o_at - i_at).total_seconds()
+                            if 0 < diff < 7200:
+                                op_response_times[op_id].append(diff)
+                            break
+
+            for op_id, times in op_response_times.items():
+                if not times:
+                    continue
+                op_info = operators_map.get(op_id, {})
+                sla_data.append({
+                    "username": op_info.get("username", f"op_{op_id}"),
+                    "full_name": op_info.get("full_name") or None,
+                    "avg_seconds": round(sum(times) / len(times)),
+                    "count": len(times),
+                })
+            sla_data.sort(key=lambda x: x["avg_seconds"])
+
+        # ── Исходы: счётчик сообщений по отправителю для каждого диалога ─────
+        outcomes_result = await session.execute(
+            select(Message.conversation_id, Message.sender, func.count().label("cnt"))
+            .where(Message.is_internal == False)
+            .group_by(Message.conversation_id, Message.sender)
+        )
+        outcomes_rows = outcomes_result.all()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  Постобработка — всё вне async with (данные уже в памяти)
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── Воронка ────────────────────────────────────────────────────────────
     new_today = 0
     new_week = 0
     for row in first_msgs:
@@ -1578,11 +1679,12 @@ async def get_analytics(
         if first_at >= week_start:
             new_week += 1
 
-    # Эффективность ИИ
+    # ── Эффективность ИИ ───────────────────────────────────────────────────
     ai_modes = {"bot", "ai_assistant"}
     ai_closed = sum(1 for c in conversations if c.intercept_mode in ai_modes)
+    operator_transferred = len(op_conv_ids)
 
-    # Популярные теги
+    # ── Популярные теги ────────────────────────────────────────────────────
     tag_counts: dict[str, int] = {}
     for c in conversations:
         if c.tags:
@@ -1597,6 +1699,70 @@ async def get_analytics(
         reverse=True,
     )[:10]
 
+    # ── Тепловая карта ─────────────────────────────────────────────────────
+    heatmap: list[list[int]] = [[0] * 24 for _ in range(7)]
+    for ts in heatmap_timestamps:
+        if ts is None:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        heatmap[ts.weekday()][ts.hour] += 1
+    heatmap_data = [
+        {"day": d, "hour": h, "count": heatmap[d][h]}
+        for d in range(7)
+        for h in range(24)
+    ]
+
+    # ── Узкие места (теги + перехваты) ────────────────────────────────────
+    tag_intercept: dict[str, dict[str, int]] = {}
+    for c in conversations:
+        if not c.tags:
+            continue
+        is_intercepted = c.id in op_conv_ids
+        for tag in c.tags.split(","):
+            tag = tag.strip()
+            if not tag:
+                continue
+            if tag not in tag_intercept:
+                tag_intercept[tag] = {"total": 0, "intercepted": 0}
+            tag_intercept[tag]["total"] += 1
+            if is_intercepted:
+                tag_intercept[tag]["intercepted"] += 1
+
+    bottleneck_tags = sorted(
+        [
+            {
+                "tag": t,
+                "total": v["total"],
+                "intercepted": v["intercepted"],
+                "rate": round(v["intercepted"] / v["total"] * 100) if v["total"] > 0 else 0,
+            }
+            for t, v in tag_intercept.items()
+            if v["total"] >= 1
+        ],
+        key=lambda x: x["rate"],
+        reverse=True,
+    )[:10]
+
+    # ── Исходы диалогов ────────────────────────────────────────────────────
+    conv_sender_counts: dict[int, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for row in outcomes_rows:
+        conv_sender_counts[row.conversation_id][row.sender] += row.cnt
+
+    resolved_by_human = 0
+    resolved_by_ai = 0
+    abandoned = 0
+    for c in conversations:
+        counts = conv_sender_counts[c.id]
+        client_count = counts.get("client", 0)
+        bot_count = counts.get("bot", 0) + counts.get("assistant", 0)
+        if c.id in op_conv_ids:
+            resolved_by_human += 1
+        elif client_count <= 2 and bot_count <= 1:
+            abandoned += 1
+        else:
+            resolved_by_ai += 1
+
     return {
         "funnel": {
             "new_today": new_today,
@@ -1608,6 +1774,14 @@ async def get_analytics(
             "total": len(conversations),
         },
         "popular_tags": popular_tags,
+        "heatmap": heatmap_data,
+        "bottleneck_tags": bottleneck_tags,
+        "sla": sla_data,
+        "outcomes": {
+            "resolved_by_human": resolved_by_human,
+            "resolved_by_ai": resolved_by_ai,
+            "abandoned": abandoned,
+        },
     }
 
 
