@@ -1593,7 +1593,7 @@ async def get_analytics(
         sla_internal_rows = sla_internal_result.all()
 
         # Фильтруем только аудит-строки с реальным оператором (содержат паттерн [login] (Роль))
-        _AUDIT_RE = re.compile(r'\[([^\]]+)\]\s*\(')
+        _AUDIT_RE = re.compile(r'\[(.*?)\]')
         sla_internal_rows = [r for r in sla_internal_rows if _AUDIT_RE.search(r.content or "")]
 
         sla_conv_ids_hist: set[int] = {r.conversation_id for r in sla_internal_rows}
