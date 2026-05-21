@@ -1568,60 +1568,77 @@ async def get_analytics(
         )
         heatmap_timestamps = heatmap_result.scalars().all()
 
-        # ── SLA: сообщения для диалогов с назначенным оператором ─────────────
-        sla_conv_map: dict[int, int] = {
-            c.id: c.operator_id for c in conversations if c.operator_id is not None
-        }
+        # ── SLA: исторический расчёт по всем перехватам за 30 дней ─────────────
+        # Берём все аудит-сообщения (is_internal) за 30 дней — даже для
+        # архивированных диалогов, где operator_id уже обнулён.
+        # Оператор определяется парсингом логина из текста сообщения ([username]).
         sla_data: list[dict] = []
-        if sla_conv_map:
-            sla_msgs_result = await session.execute(
+
+        sla_internal_result = await session.execute(
+            select(
+                Message.conversation_id,
+                Message.content,
+                Message.created_at,
+            )
+            .where(
+                Message.sender == "system",
+                Message.is_internal == True,
+                Message.created_at >= month_ago,
+            )
+            .order_by(Message.conversation_id, Message.created_at)
+        )
+        sla_internal_rows = sla_internal_result.all()
+
+        sla_conv_ids_hist: set[int] = {r.conversation_id for r in sla_internal_rows}
+
+        if sla_conv_ids_hist:
+            sla_op_msgs_result = await session.execute(
                 select(
                     Message.conversation_id,
-                    Message.sender,
-                    Message.is_internal,
                     Message.created_at,
                 )
                 .where(
-                    Message.conversation_id.in_(list(sla_conv_map.keys())),
-                    or_(
-                        and_(Message.sender == "system", Message.is_internal == True),
-                        Message.sender == "operator",
-                    ),
+                    Message.conversation_id.in_(sla_conv_ids_hist),
+                    Message.sender == "operator",
                 )
                 .order_by(Message.conversation_id, Message.created_at)
             )
-            sla_msgs_rows = sla_msgs_result.all()
+            sla_op_msgs_rows = sla_op_msgs_result.all()
 
-            op_ids_needed = list({v for v in sla_conv_map.values()})
-            ops_result = await session.execute(
+            all_ops_result = await session.execute(
                 select(Operator.id, Operator.username, Operator.full_name)
-                .where(Operator.id.in_(op_ids_needed))
             )
-            operators_map: dict[int, dict] = {
-                row.id: {"username": row.username, "full_name": row.full_name}
-                for row in ops_result.all()
+            operators_by_username: dict[str, dict] = {
+                row.username: {"id": row.id, "full_name": row.full_name}
+                for row in all_ops_result.all()
             }
 
-            # Группируем сообщения по диалогу и считаем SLA
-            conv_to_sla_msgs: dict[int, list] = defaultdict(list)
-            for row in sla_msgs_rows:
-                conv_to_sla_msgs[row.conversation_id].append(row)
+            def _parse_username_from_audit(content: str) -> str | None:
+                """Извлекает [username] из аудит-строки перехвата."""
+                m = re.search(r'\[([^\]\s]+)\]', content or "")
+                return m.group(1) if m else None
 
-            op_response_times: dict[int, list[float]] = defaultdict(list)
-            for conv_id, msgs in conv_to_sla_msgs.items():
-                op_id = sla_conv_map.get(conv_id)
-                if not op_id:
-                    continue
-                intercepts = sorted(
-                    [m for m in msgs if m.sender == "system" and m.is_internal],
-                    key=lambda m: m.created_at or datetime.min,
-                )
+            # Группируем operator-сообщения по диалогу
+            conv_to_op_msgs: dict[int, list] = defaultdict(list)
+            for row in sla_op_msgs_rows:
+                conv_to_op_msgs[row.conversation_id].append(row)
+
+            # Считаем время реакции: intercept → первый ответ оператора
+            op_response_times_hist: dict[str, list[float]] = defaultdict(list)
+            conv_to_internals: dict[int, list] = defaultdict(list)
+            for row in sla_internal_rows:
+                conv_to_internals[row.conversation_id].append(row)
+
+            for conv_id, internals in conv_to_internals.items():
                 op_msgs = sorted(
-                    [m for m in msgs if m.sender == "operator"],
+                    conv_to_op_msgs.get(conv_id, []),
                     key=lambda m: m.created_at or datetime.min,
                 )
-                for intercept in intercepts:
-                    i_at = intercept.created_at
+                for internal in internals:
+                    username = _parse_username_from_audit(internal.content)
+                    if not username:
+                        continue
+                    i_at = internal.created_at
                     if i_at is None:
                         continue
                     if i_at.tzinfo is None:
@@ -1635,15 +1652,15 @@ async def get_analytics(
                         if o_at > i_at:
                             diff = (o_at - i_at).total_seconds()
                             if 0 < diff < 7200:
-                                op_response_times[op_id].append(diff)
+                                op_response_times_hist[username].append(diff)
                             break
 
-            for op_id, times in op_response_times.items():
+            for username, times in op_response_times_hist.items():
                 if not times:
                     continue
-                op_info = operators_map.get(op_id, {})
+                op_info = operators_by_username.get(username, {})
                 sla_data.append({
-                    "username": op_info.get("username", f"op_{op_id}"),
+                    "username": username,
                     "full_name": op_info.get("full_name") or None,
                     "avg_seconds": round(sum(times) / len(times)),
                     "count": len(times),
@@ -1987,11 +2004,13 @@ async def update_intercept_mode(
         _name_part = f"{_full_name} [{_login}]" if _full_name else f"[{_login}]"
         _role_label = (body.operator_role or "").strip() or "Специалист"
         _os = (body.operator_os or "").strip() or "—"
-        _ip = _get_client_ip(request) or "—"
+        _ip_raw = _get_client_ip(request)
+        _ip = _ip_raw or "—"
+        _geo = await _fetch_geolocation(_ip_raw) if _ip_raw else "—"
         _trigger = (body.trigger or "").strip() or "Инициатива оператора"
         _mode_label = get_intercept_mode_label_ru(new_mode)
         internal_text = (
-            f"{_time_str} • {_name_part} ({_role_label}) • {_os} • "
+            f"{_time_str} • {_name_part} ({_role_label}) • {_os} • {_geo} • "
             f"IP: {_ip} • Триггер: {_trigger} • Режим: {_mode_label}"
         )
         internal_msg = Message(
