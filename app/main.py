@@ -1640,6 +1640,9 @@ async def get_analytics(
 
             def _parse_username_from_audit(content: str) -> str | None:
                 """Извлекает username из аудит-строки формата '... [username] (Роль) ...'."""
+                m = re.search(r'\[([^\]]+)\]\s*\(', content or "")
+                if m:
+                    return m.group(1).strip()
                 m = _AUDIT_RE.search(content or "")
                 return m.group(1).strip() if m else None
 
@@ -1677,18 +1680,20 @@ async def get_analytics(
                     if i_at.tzinfo is None:
                         i_at = i_at.replace(tzinfo=timezone.utc)
 
-                    # Старт SLA: ищем «Перевожу вас на специалиста» до момента перехвата
-                    # в пределах 1 часа — значит, клиент инициировал запрос
+                    # Старт SLA: при инициативе оператора — момент аудит-лога;
+                    # иначе ищем «Перевожу вас на специалиста» до перехвата (запрос клиента)
                     sla_start = i_at
-                    for transfer in reversed(transfers):
-                        t_at = transfer.created_at
-                        if t_at is None:
-                            continue
-                        if t_at.tzinfo is None:
-                            t_at = t_at.replace(tzinfo=timezone.utc)
-                        if t_at < i_at and (i_at - t_at).total_seconds() <= 3600:
-                            sla_start = t_at
-                            break
+                    audit_content = internal.content or ""
+                    if "Триггер: Инициатива оператора" not in audit_content:
+                        for transfer in reversed(transfers):
+                            t_at = transfer.created_at
+                            if t_at is None:
+                                continue
+                            if t_at.tzinfo is None:
+                                t_at = t_at.replace(tzinfo=timezone.utc)
+                            if t_at < i_at and (i_at - t_at).total_seconds() <= 3600:
+                                sla_start = t_at
+                                break
 
                     # Первый ответ оператора после момента перехвата
                     for op_msg in op_msgs:
@@ -1697,16 +1702,23 @@ async def get_analytics(
                             continue
                         if o_at.tzinfo is None:
                             o_at = o_at.replace(tzinfo=timezone.utc)
-                        if o_at > i_at:
+                        if o_at >= i_at:
                             diff = (o_at - sla_start).total_seconds()
-                            if 0 < diff < 7200:
+                            if 0 <= diff < 7200:
                                 op_response_times_hist[username].append(diff)
                             break
 
             for username, times in op_response_times_hist.items():
                 if not times:
                     continue
-                op_info = operators_by_username.get(username, {})
+                op_info = operators_by_username.get(username)
+                if op_info is None:
+                    for op_username, info in operators_by_username.items():
+                        if op_username.lower() == username.lower():
+                            op_info = info
+                            username = op_username
+                            break
+                op_info = op_info or {}
                 sla_data.append({
                     "username": username,
                     "full_name": op_info.get("full_name") or None,
@@ -2040,11 +2052,7 @@ async def update_intercept_mode(
             conv.operator_name = (body.operator_name or "").strip() or _operator.username
 
     # Скрытое системное сообщение при перехвате (видны только в Терминале)
-    if prev_mode == INTERCEPT_MODE_BOT and new_mode in {
-        INTERCEPT_MODE_PROMPTER,
-        INTERCEPT_MODE_MANUAL,
-        INTERCEPT_MODE_SENIOR,
-    }:
+    if prev_mode != new_mode:
         _ts = datetime.now(timezone.utc)
         _time_str = _ts.strftime("%H:%M")
         _login = _operator.username
