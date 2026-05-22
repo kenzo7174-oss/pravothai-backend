@@ -75,7 +75,7 @@ from app.services.ai_dispatcher import (
     process_incoming_client_message,
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
-from app.services.openai_service import check_offline_block, generate_draft, transcribe_voice
+from app.services.openai_service import auto_tag_conversation, check_offline_block, generate_draft, transcribe_voice
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
 from jose import JWTError, jwt
@@ -2007,6 +2007,7 @@ async def update_intercept_mode(
     conversation_id: int,
     body: InterceptModeUpdate,
     request: Request,
+    background_tasks: BackgroundTasks,
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
@@ -2106,6 +2107,12 @@ async def update_intercept_mode(
     # manual — без уведомлений (бесшовный перехват)
 
     await session.commit()
+
+    if (
+        prev_mode == INTERCEPT_MODE_BOT
+        and new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_PROMPTER, INTERCEPT_MODE_SENIOR}
+    ):
+        background_tasks.add_task(auto_tag_conversation, conv.id)
 
     return {
         "conversation_id": conv.id,

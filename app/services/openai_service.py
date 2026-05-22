@@ -16,7 +16,8 @@ from openai import AsyncOpenAI, APIError
 from sqlalchemy import select
 
 from app.core.config import settings
-from app.models import Message, SystemSettings
+from app.core.database import AsyncSessionLocal
+from app.models import Conversation, Message, SystemSettings
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -299,3 +300,121 @@ async def generate_draft(
         log.error("Непредвиденная ошибка при генерации черновика: %s", exc)
 
     return None, False
+
+
+DEFAULT_CONVERSATION_TAGS = frozenset({"web", "telegram"})
+
+AUTO_TAG_SYSTEM_PROMPT = (
+    "Проанализируй диалог и выдай строго одно короткое слово-тег — причину, "
+    "по которой потребовался человек (например: Оплата, Баг, Доставка, Консультация). "
+    "Выведи только одно слово, без точек, кавычек и лишних символов."
+)
+
+AUTO_TAG_SENDER_LABELS = {
+    "client": "Клиент",
+    "support": "Оператор",
+    "operator": "Оператор",
+    "bot": "ИИ",
+    "assistant": "ИИ",
+}
+
+
+def _parse_conversation_tags(tags_str: str) -> list[str]:
+    if not tags_str:
+        return []
+    return [tag.strip() for tag in tags_str.split(",") if tag.strip()]
+
+
+def _has_meaningful_tag(tags_str: str) -> bool:
+    """True, если среди тегов есть не дефолтный (не web/telegram)."""
+    for tag in _parse_conversation_tags(tags_str):
+        if tag.lower() not in DEFAULT_CONVERSATION_TAGS:
+            return True
+    return False
+
+
+def _normalize_auto_tag(raw: str) -> str | None:
+    """Приводит ответ ИИ к одному слову-тегу."""
+    if not raw or not raw.strip():
+        return None
+    cleaned = raw.strip().strip('"\'«»“”‘’.')
+    word = cleaned.split()[0] if cleaned else ""
+    word = re.sub(r"[^\w\-]", "", word, flags=re.UNICODE)
+    return word or None
+
+
+def _format_messages_for_auto_tag(messages: list[Message]) -> str:
+    lines = []
+    for msg in messages:
+        label = AUTO_TAG_SENDER_LABELS.get(msg.sender, msg.sender)
+        lines.append(f"{label}: {msg.content}")
+    return "\n".join(lines)
+
+
+async def auto_tag_conversation(conversation_id: int) -> None:
+    """Фоновое авто-тегирование диалога при перехвате оператором."""
+    try:
+        async with AsyncSessionLocal() as session:
+            conv = await session.get(Conversation, conversation_id)
+            if not conv:
+                log.warning("auto_tag: диалог %s не найден", conversation_id)
+                return
+
+            if _has_meaningful_tag(conv.tags):
+                return
+
+            result = await session.execute(
+                select(Message)
+                .where(
+                    Message.conversation_id == conversation_id,
+                    Message.is_internal.is_(False),
+                )
+                .order_by(Message.created_at.desc())
+                .limit(10)
+            )
+            recent_messages = list(reversed(result.scalars().all()))
+            if not recent_messages:
+                log.info("auto_tag: нет сообщений для диалога %s", conversation_id)
+                return
+
+            dialog_text = _format_messages_for_auto_tag(recent_messages)
+            if not dialog_text.strip():
+                return
+
+            api_key = settings.OPENAI_API_KEY
+            if not api_key:
+                log.warning("OPENAI_API_KEY не задан — авто-тегирование пропущено")
+                return
+
+            client = AsyncOpenAI(api_key=api_key)
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": AUTO_TAG_SYSTEM_PROMPT},
+                    {"role": "user", "content": dialog_text},
+                ],
+                max_tokens=16,
+                temperature=0.2,
+            )
+            raw_tag = (response.choices[0].message.content or "").strip()
+            new_tag = _normalize_auto_tag(raw_tag)
+            if not new_tag:
+                log.warning(
+                    "auto_tag: пустой тег от ИИ для диалога %s (raw=%r)",
+                    conversation_id,
+                    raw_tag,
+                )
+                return
+
+            existing_tags = _parse_conversation_tags(conv.tags)
+            if any(tag.lower() == new_tag.lower() for tag in existing_tags):
+                return
+
+            conv.tags = f"{conv.tags}, {new_tag}" if conv.tags else new_tag
+            await session.commit()
+            log.info("auto_tag: диалог %s помечен тегом %r", conversation_id, new_tag)
+
+    except APIError as exc:
+        log.error("auto_tag: OpenAI API error для диалога %s: %s", conversation_id, exc)
+    except Exception as exc:
+        log.error("auto_tag: ошибка для диалога %s: %s", conversation_id, exc)
