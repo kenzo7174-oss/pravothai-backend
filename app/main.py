@@ -2108,10 +2108,7 @@ async def update_intercept_mode(
 
     await session.commit()
 
-    if (
-        prev_mode == INTERCEPT_MODE_BOT
-        and new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_PROMPTER, INTERCEPT_MODE_SENIOR}
-    ):
+    if new_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_PROMPTER, INTERCEPT_MODE_SENIOR}:
         background_tasks.add_task(auto_tag_conversation, conv.id)
 
     return {
