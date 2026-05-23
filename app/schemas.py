@@ -53,6 +53,8 @@ class OperatorSchema(BaseModel):
     is_active: bool
     is_online: bool = False
     last_login: Optional[datetime] = None
+    last_device_os: Optional[str] = None
+    last_device_browser: Optional[str] = None
 
 
 class OperatorProfileUpdate(BaseModel):

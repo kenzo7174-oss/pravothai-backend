@@ -7,7 +7,7 @@ Axoloti Terminal — JWT-аутентификация.
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -67,7 +67,18 @@ def decode_setup_token(token: str) -> str | None:
         return None
 
 
+def apply_operator_device_from_request(operator, request: Request) -> None:
+    """Сохраняет ОС и браузер оператора из заголовков клиента."""
+    os_header = (request.headers.get("X-Axoloti-Client-OS") or "").strip()[:64]
+    browser_header = (request.headers.get("X-Axoloti-Client-Browser") or "").strip()[:64]
+    if os_header and hasattr(operator, "last_device_os"):
+        operator.last_device_os = os_header
+    if browser_header and hasattr(operator, "last_device_browser"):
+        operator.last_device_browser = browser_header
+
+
 async def get_current_operator(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     session: AsyncSession = Depends(get_session),
 ):
@@ -114,6 +125,8 @@ async def get_current_operator(
 
     if hasattr(operator, "last_active"):
         operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
-        await session.commit()
+
+    apply_operator_device_from_request(operator, request)
+    await session.commit()
 
     return operator

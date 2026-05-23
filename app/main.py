@@ -34,6 +34,7 @@ from app.core.auth import (
     create_setup_token,
     decode_setup_token,
     get_current_operator,
+    apply_operator_device_from_request,
 )
 from app.models import (
     BroadcastHistory,
@@ -388,6 +389,14 @@ async def ensure_conversation_runtime_columns() -> None:
         if "last_login" not in op_columns:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN last_login TIMESTAMP"
+            ))
+        if "last_device_os" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN last_device_os VARCHAR(64)"
+            ))
+        if "last_device_browser" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN last_device_browser VARCHAR(64)"
             ))
         if "link" not in op_columns:
             await conn.execute(text(
@@ -849,6 +858,7 @@ async def _get_setup_username(
 @app.post("/api/v1/auth/set-password", response_model=TokenResponse)
 async def set_password(
     body: SetPasswordRequest,
+    request: Request,
     setup_username: str = Depends(_get_setup_username),
     session: AsyncSession = Depends(get_session),
 ):
@@ -868,6 +878,7 @@ async def set_password(
     operator.hashed_password = hash_password(body.new_password)
     operator.needs_password_setup = False
     operator.last_active = datetime.now(timezone.utc).replace(tzinfo=None)
+    apply_operator_device_from_request(operator, request)
     await session.commit()
     await session.refresh(operator)
 
@@ -883,6 +894,7 @@ async def set_password(
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
 async def login(
     body: LoginRequest,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ):
     """Аутентификация по логину и паролю. Доступна для всех ролей."""
@@ -910,6 +922,7 @@ async def login(
     _now = datetime.now(timezone.utc).replace(tzinfo=None)
     operator.last_active = _now
     operator.last_login = _now
+    apply_operator_device_from_request(operator, request)
     await session.commit()
     await session.refresh(operator)
 
@@ -999,6 +1012,8 @@ async def get_team(
             is_active=getattr(op, "is_active", True),
             is_online=_is_online(op),
             last_login=getattr(op, "last_login", None),
+            last_device_os=getattr(op, "last_device_os", None) or None,
+            last_device_browser=getattr(op, "last_device_browser", None) or None,
         )
         for op in operators
     ]

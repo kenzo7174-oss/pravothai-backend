@@ -37,6 +37,8 @@ class Operator(Base):
     needs_password_setup: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_active: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_device_os: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_device_browser: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     def __repr__(self) -> str:
         return f"<Operator #{self.id} {self.username}>"
