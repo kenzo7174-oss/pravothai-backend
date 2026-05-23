@@ -42,9 +42,9 @@ from app.core.avatars import (
     ensure_avatar_dir,
     detect_image_ext,
     media_type_for_ext,
-    avatar_path_for_operator,
     resolve_avatar_path,
     delete_operator_avatar_files,
+    save_operator_avatar,
 )
 from app.models import (
     BroadcastHistory,
@@ -1007,12 +1007,19 @@ async def upload_operator_avatar(
     if not ext:
         raise HTTPException(status_code=400, detail="Допустимы только изображения JPEG, PNG, WebP или GIF")
 
-    ensure_avatar_dir()
-    delete_operator_avatar_files(operator.id)
-    dest = avatar_path_for_operator(operator.id, ext)
-    dest.write_bytes(content)
+    try:
+        filename = save_operator_avatar(operator.id, content, ext)
+    except OSError as exc:
+        log.error("Failed to save avatar for operator %s: %s", operator.id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Не удалось сохранить файл на сервере. Проверьте права доступа к каталогу загрузок.",
+        ) from exc
 
-    operator.photo_path = dest.name
+    if not resolve_avatar_path(filename):
+        raise HTTPException(status_code=500, detail="Файл сохранён, но не найден на диске")
+
+    operator.photo_path = filename
     await session.commit()
     return {"has_photo": True}
 
@@ -1148,6 +1155,7 @@ async def delete_team_member(
     op = result.scalar_one_or_none()
     if op is None:
         raise HTTPException(status_code=404, detail="Оператор не найден")
+    delete_operator_avatar_files(user_id)
     await session.delete(op)
     await session.commit()
     return {"deleted": True}
