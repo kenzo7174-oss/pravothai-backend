@@ -17,7 +17,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request
+from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request, UploadFile, File
+from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, func, or_, select, text
@@ -35,6 +36,15 @@ from app.core.auth import (
     decode_setup_token,
     get_current_operator,
     apply_operator_device_from_request,
+)
+from app.core.avatars import (
+    MAX_AVATAR_BYTES,
+    ensure_avatar_dir,
+    detect_image_ext,
+    media_type_for_ext,
+    avatar_path_for_operator,
+    resolve_avatar_path,
+    delete_operator_avatar_files,
 )
 from app.models import (
     BroadcastHistory,
@@ -398,6 +408,10 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN last_device_browser VARCHAR(64)"
             ))
+        if "photo_path" not in op_columns:
+            await conn.execute(text(
+                "ALTER TABLE operators ADD COLUMN photo_path VARCHAR(255)"
+            ))
         if "link" not in op_columns:
             await conn.execute(text(
                 "ALTER TABLE operators ADD COLUMN link VARCHAR(500)"
@@ -696,6 +710,7 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await ensure_conversation_runtime_columns()
+    ensure_avatar_dir()
     await seed_default_operator()
     await ensure_first_operator_is_owner()
     await register_telegram_webhook_on_startup()
@@ -938,15 +953,16 @@ async def login(
 @app.get("/api/v1/auth/me")
 async def get_current_operator_info(
     _operator: Operator = Depends(get_current_operator),
-    session: AsyncSession = Depends(get_session),
 ):
-    """Возвращает данные текущего оператора (id, username, role, full_name, job_title)."""
+    """Возвращает данные текущего оператора."""
+    photo_path = getattr(_operator, "photo_path", None)
     return {
         "id": _operator.id,
         "username": _operator.username,
         "role": getattr(_operator, "role", "operator"),
         "full_name": getattr(_operator, "full_name", None) or None,
         "job_title": getattr(_operator, "job_title", None) or None,
+        "has_photo": bool(photo_path and resolve_avatar_path(photo_path)),
     }
 
 
@@ -956,20 +972,72 @@ async def update_current_operator_profile(
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
-    """Обновляет full_name и job_title только для текущего авторизованного оператора (current_user.id)."""
+    """Обновляет full_name и job_title только для текущего авторизованного оператора."""
     if body.full_name is not None:
         _operator.full_name = (body.full_name or "").strip() or None
     if body.job_title is not None:
         _operator.job_title = (body.job_title or "").strip() or None
     await session.commit()
     await session.refresh(_operator)
+    photo_path = getattr(_operator, "photo_path", None)
     return {
         "id": _operator.id,
         "username": _operator.username,
         "role": getattr(_operator, "role", "operator"),
         "full_name": getattr(_operator, "full_name", None) or None,
         "job_title": getattr(_operator, "job_title", None) or None,
+        "has_photo": bool(photo_path and resolve_avatar_path(photo_path)),
     }
+
+
+@app.post("/api/v1/operators/me/avatar")
+async def upload_operator_avatar(
+    file: UploadFile = File(...),
+    operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Загружает аватар текущего оператора (JPEG/PNG/WebP/GIF, до 5 МБ)."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Файл пустой")
+    if len(content) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=400, detail="Файл слишком большой (макс. 5 МБ)")
+
+    ext = detect_image_ext(content, file.content_type)
+    if not ext:
+        raise HTTPException(status_code=400, detail="Допустимы только изображения JPEG, PNG, WebP или GIF")
+
+    ensure_avatar_dir()
+    delete_operator_avatar_files(operator.id)
+    dest = avatar_path_for_operator(operator.id, ext)
+    dest.write_bytes(content)
+
+    operator.photo_path = dest.name
+    await session.commit()
+    return {"has_photo": True}
+
+
+@app.get("/api/v1/operators/me/avatar")
+async def get_operator_avatar(
+    operator: Operator = Depends(get_current_operator),
+):
+    """Возвращает файл аватара текущего оператора."""
+    path = resolve_avatar_path(getattr(operator, "photo_path", None))
+    if path is None:
+        raise HTTPException(status_code=404, detail="Фото не найдено")
+    return FileResponse(path, media_type=media_type_for_ext(path.suffix))
+
+
+@app.delete("/api/v1/operators/me/avatar")
+async def delete_operator_avatar(
+    operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Удаляет аватар текущего оператора."""
+    delete_operator_avatar_files(operator.id)
+    operator.photo_path = None
+    await session.commit()
+    return {"has_photo": False}
 
 
 def require_owner(_operator: Operator = Depends(get_current_operator)) -> Operator:

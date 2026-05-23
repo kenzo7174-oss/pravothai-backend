@@ -39,6 +39,7 @@ class Operator(Base):
     last_login: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_device_os: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_device_browser: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    photo_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     def __repr__(self) -> str:
         return f"<Operator #{self.id} {self.username}>"
