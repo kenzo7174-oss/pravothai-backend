@@ -1032,7 +1032,11 @@ async def get_operator_avatar(
     path = resolve_avatar_path(getattr(operator, "photo_path", None))
     if path is None:
         raise HTTPException(status_code=404, detail="Фото не найдено")
-    return FileResponse(path, media_type=media_type_for_ext(path.suffix))
+    return FileResponse(
+        path,
+        media_type=media_type_for_ext(path.suffix),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.delete("/api/v1/operators/me/avatar")
