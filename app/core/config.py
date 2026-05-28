@@ -29,6 +29,9 @@ OPENAI_RESPONSE_ID = (
 
 DEFAULT_ADMIN_USER = os.getenv("DEFAULT_ADMIN_USER", "admin")
 DEFAULT_ADMIN_PASSWORD = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin")
+VAPID_PUBLIC_KEY = os.getenv("VAPID_PUBLIC_KEY", "").strip()
+VAPID_PRIVATE_KEY = os.getenv("VAPID_PRIVATE_KEY", "").strip()
+VAPID_CONTACT_EMAIL = os.getenv("VAPID_CONTACT_EMAIL", "mailto:admin@axoloti.ru").strip()
 
 
 class Settings:
@@ -49,6 +52,9 @@ class Settings:
     OPENAI_RESPONSE_ID: Optional[str] = OPENAI_RESPONSE_ID
     DEFAULT_ADMIN_USER: str = DEFAULT_ADMIN_USER
     DEFAULT_ADMIN_PASSWORD: str = DEFAULT_ADMIN_PASSWORD
+    VAPID_PUBLIC_KEY: str = VAPID_PUBLIC_KEY
+    VAPID_PRIVATE_KEY: str = VAPID_PRIVATE_KEY
+    VAPID_CONTACT_EMAIL: str = VAPID_CONTACT_EMAIL
 
 
 settings = Settings()

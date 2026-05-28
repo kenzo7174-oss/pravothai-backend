@@ -15,6 +15,7 @@ from app.core.database import AsyncSessionLocal
 from app.core.sse import sse_manager
 from app.models import Conversation, Message
 from app.services.openai_service import check_offline_block, generate_draft
+from app.services.push_service import push_specialist_requested
 from app.services.telegram import send_telegram_message
 
 log = logging.getLogger(__name__)
@@ -150,3 +151,4 @@ async def process_incoming_client_message(
         finally:
             if request_operator:
                 await sse_manager.broadcast("chat_updated", {"conversation_id": conversation_id})
+                await push_specialist_requested(conversation_id)

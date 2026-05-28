@@ -52,6 +52,7 @@ from app.models import (
     Conversation,
     Message,
     Operator,
+    PushSubscription,
     ScheduledBroadcast,
     SystemSettings,
     DEFAULT_SENIOR_WELCOME_MESSAGE,
@@ -76,6 +77,8 @@ from app.schemas import (
     SystemSettingsSchema,
     SystemSettingsUpdate,
     TokenResponse,
+    VapidPublicKeyResponse,
+    PushSubscriptionCreate,
 )
 from app.services.ai_dispatcher import (
     INTERCEPT_MODE_BOT,
@@ -87,6 +90,12 @@ from app.services.ai_dispatcher import (
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
 from app.services.openai_service import auto_tag_conversation, check_offline_block, generate_draft, transcribe_voice
+from app.services.push_service import (
+    push_new_conversation,
+    push_new_message,
+    push_specialist_requested,
+    schedule_push,
+)
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
 from jose import JWTError, jwt
@@ -964,6 +973,63 @@ async def get_current_operator_info(
         "job_title": getattr(_operator, "job_title", None) or None,
         "has_photo": bool(photo_path and resolve_avatar_path(photo_path)),
     }
+
+
+@app.get("/api/v1/push/vapid-public-key", response_model=VapidPublicKeyResponse)
+async def get_vapid_public_key(
+    _operator: Operator = Depends(get_current_operator),
+):
+    """Публичный VAPID-ключ для подписки браузера на Web Push."""
+    public_key = (settings.VAPID_PUBLIC_KEY or "").strip()
+    if not public_key:
+        raise HTTPException(status_code=503, detail="VAPID public key не настроен на сервере")
+    return VapidPublicKeyResponse(publicKey=public_key)
+
+
+@app.post("/api/v1/push/subscribe", status_code=204)
+async def save_push_subscription(
+    body: PushSubscriptionCreate,
+    request: Request,
+    operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Сохраняет или обновляет Web Push подписку текущего оператора."""
+    endpoint = (body.endpoint or "").strip()
+    if not endpoint:
+        raise HTTPException(status_code=400, detail="endpoint обязателен")
+
+    p256dh = (body.keys.p256dh or "").strip()
+    auth_key = (body.keys.auth or "").strip()
+    if not p256dh or not auth_key:
+        raise HTTPException(status_code=400, detail="keys.p256dh и keys.auth обязательны")
+
+    result = await session.execute(
+        select(PushSubscription).where(PushSubscription.endpoint == endpoint)
+    )
+    row = result.scalar_one_or_none()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    user_agent = (request.headers.get("user-agent") or "")[:255] or None
+
+    if row is None:
+        row = PushSubscription(
+            operator_id=operator.id,
+            endpoint=endpoint,
+            p256dh=p256dh,
+            auth=auth_key,
+            user_agent=user_agent,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+    else:
+        row.operator_id = operator.id
+        row.p256dh = p256dh
+        row.auth = auth_key
+        row.user_agent = user_agent
+        row.updated_at = now
+
+    await session.commit()
+    return None
 
 
 @app.put("/api/v1/operators/me")
@@ -2295,6 +2361,9 @@ async def generate_draft_endpoint(
         conv.specialist_requested = True
     await session.commit()
 
+    if request_operator:
+        schedule_push(push_specialist_requested(conversation_id))
+
     return {"draft": draft}
 
 
@@ -2369,7 +2438,9 @@ async def process_telegram_task(update_data: dict) -> None:
             )
             conv = result.scalar_one_or_none()
 
+            is_new_conversation = False
             if conv is None:
+                is_new_conversation = True
                 # ── Новый клиент + диалог ────────────────────────────────────────
                 tg_original = f"@{username}" if username else full_name
                 client = Client(
@@ -2420,6 +2491,10 @@ async def process_telegram_task(update_data: dict) -> None:
 
             await session.commit()
             await session.refresh(msg)
+
+            if is_new_conversation:
+                schedule_push(push_new_conversation(conv.id))
+            schedule_push(push_new_message(conv.operator_id, text, conv.id))
 
             if conv.has_new_contact or conv.specialist_requested:
                 async with AsyncSessionLocal() as s:
@@ -2743,6 +2818,7 @@ async def web_widget_webhook(
     # Теперь ищем диалог для этого клиента
     thread_id_raw = body.get("thread_id")
     conv = None
+    is_new_conversation = False
 
     if thread_id_raw:
         conv_id = _parse_thread_id_int(thread_id_raw)
@@ -2773,6 +2849,7 @@ async def web_widget_webhook(
     if conv is None:
         social_id = visitor_id or str(uuid.uuid4())
         web_label = f"Web: {client.original_name or client.name}"
+        is_new_conversation = True
         conv = Conversation(
             client_id=client.id,
             source="web",
@@ -2805,6 +2882,10 @@ async def web_widget_webhook(
 
     await session.commit()
     await session.refresh(msg)
+
+    if is_new_conversation:
+        schedule_push(push_new_conversation(conv.id))
+    schedule_push(push_new_message(conv.operator_id, text, conv.id))
 
     if conv.has_new_contact or conv.specialist_requested:
         async with AsyncSessionLocal() as s:
@@ -2875,6 +2956,7 @@ async def web_widget_webhook(
                 session.add(ai_msg)
                 await session.commit()
                 await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+                schedule_push(push_specialist_requested(conv.id))
         elif draft:
             conv.pending_draft = draft
             conv.pending_draft_message_id = msg.id
@@ -2938,6 +3020,7 @@ async def web_widget_webhook(
 
     if request_operator:
         await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+        schedule_push(push_specialist_requested(conv.id))
 
     return {
         "reply": content_to_reply or "Извините, не удалось сформировать ответ. Попробуйте позже.",

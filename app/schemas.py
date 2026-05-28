@@ -236,3 +236,18 @@ class ClientSchema(BaseModel):
     notes: str
     tags: str
     conversations: list[ConversationSchema] = []
+
+
+class VapidPublicKeyResponse(BaseModel):
+    publicKey: str
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str
+    auth: str
+
+
+class PushSubscriptionCreate(BaseModel):
+    endpoint: str
+    keys: PushSubscriptionKeys
+    expirationTime: Optional[int] = None

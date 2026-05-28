@@ -227,3 +227,26 @@ class BroadcastHistory(Base):
 
     def __repr__(self) -> str:
         return f"<BroadcastHistory {self.id} status={self.status} recipients={self.recipients_count}>"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PUSH SUBSCRIPTION — Web Push подписки операторов (мобильные устройства)
+# ═══════════════════════════════════════════════════════════════════════════
+class PushSubscription(Base):
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    operator_id: Mapped[int] = mapped_column(
+        ForeignKey("operators.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    endpoint: Mapped[str] = mapped_column(String(768), unique=True, nullable=False)
+    p256dh: Mapped[str] = mapped_column(String(255), nullable=False)
+    auth: Mapped[str] = mapped_column(String(255), nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+
+    def __repr__(self) -> str:
+        return f"<PushSubscription #{self.id} operator={self.operator_id}>"
