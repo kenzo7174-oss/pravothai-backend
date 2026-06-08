@@ -63,6 +63,8 @@ from app.schemas import (
     CheckLoginRequest,
     CheckLoginResponse,
     OperatorProfileUpdate,
+    UpdateCredentialsRequest,
+    UpdateCredentialsResponse,
     OperatorSchema,
     ScheduledBroadcastSchema,
     ClientMergeRequest,
@@ -76,9 +78,19 @@ from app.schemas import (
     SetPasswordRequest,
     SystemSettingsSchema,
     SystemSettingsUpdate,
+    DatabaseStorageSchema,
+    StorageChannelsSchema,
+    StorageCleanupRequest,
+    StorageCleanupResponse,
     TokenResponse,
     VapidPublicKeyResponse,
     PushSubscriptionCreate,
+)
+from app.services.db_storage import (
+    build_storage_status,
+    cleanup_old_conversations,
+    get_database_size_bytes,
+    get_unique_channels,
 )
 from app.services.ai_dispatcher import (
     INTERCEPT_MODE_BOT,
@@ -1117,6 +1129,58 @@ async def delete_operator_avatar(
     return {"has_photo": False}
 
 
+@app.post("/api/v1/users/update-credentials", response_model=UpdateCredentialsResponse)
+async def update_user_credentials(
+    body: UpdateCredentialsRequest,
+    operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Обновляет логин и/или пароль текущего оператора после проверки текущего пароля."""
+    if not verify_password(body.current_password, operator.hashed_password):
+        raise HTTPException(status_code=400, detail="Неверный текущий пароль")
+
+    new_username = (body.new_username or "").strip() or None
+    new_password = (body.new_password or "").strip() or None
+
+    if not new_username and not new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="Укажите новый логин и/или новый пароль",
+        )
+
+    username_changed = False
+    password_changed = False
+    new_token: str | None = None
+
+    if new_username and new_username != operator.username:
+        if len(new_username) < 3:
+            raise HTTPException(status_code=400, detail="Логин должен быть не менее 3 символов")
+        existing = await session.execute(
+            select(Operator).where(Operator.username == new_username, Operator.id != operator.id)
+        )
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="Пользователь с таким логином уже существует")
+        operator.username = new_username
+        username_changed = True
+        new_token = create_access_token(subject=new_username)
+
+    if new_password:
+        if len(new_password) < 4:
+            raise HTTPException(status_code=400, detail="Пароль должен быть не менее 4 символов")
+        operator.hashed_password = hash_password(new_password)
+        password_changed = True
+
+    await session.commit()
+    await session.refresh(operator)
+
+    return UpdateCredentialsResponse(
+        username=operator.username,
+        password_changed=password_changed,
+        username_changed=username_changed,
+        access_token=new_token,
+    )
+
+
 def require_owner(_operator: Operator = Depends(get_current_operator)) -> Operator:
     """Зависимость: только для владельца (role == 'owner')."""
     if getattr(_operator, "role", "operator") != "owner":
@@ -1295,6 +1359,42 @@ async def patch_settings(
         business_end=getattr(settings, "business_end", "18:00"),
         operator_sla_minutes=getattr(settings, "operator_sla_minutes", 5),
     )
+
+
+@app.get("/api/v1/storage", response_model=DatabaseStorageSchema)
+async def get_database_storage(
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Текущий размер базы данных и процент заполненности от лимита провайдера (Neon / Aiven)."""
+    size_bytes = await get_database_size_bytes(session)
+    return DatabaseStorageSchema(**build_storage_status(size_bytes))
+
+
+@app.get("/api/v1/storage/channels", response_model=StorageChannelsSchema)
+async def get_storage_channels(
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
+    """Уникальные каналы (source), присутствующие в базе данных."""
+    channels = await get_unique_channels(session)
+    return StorageChannelsSchema(channels=channels)
+
+
+@app.post("/api/v1/storage/cleanup", response_model=StorageCleanupResponse)
+async def cleanup_database_storage(
+    body: StorageCleanupRequest,
+    _owner: Operator = Depends(require_owner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Удаляет неактивные диалоги или сообщения по выбранным каналам. Только для владельца."""
+    deleted_count = await cleanup_old_conversations(
+        session,
+        body.days,
+        body.channels_to_delete,
+        body.delete_mode,
+    )
+    return StorageCleanupResponse(deleted_count=deleted_count, delete_mode=body.delete_mode)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

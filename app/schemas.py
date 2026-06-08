@@ -63,6 +63,22 @@ class OperatorProfileUpdate(BaseModel):
     job_title: Optional[str] = None
 
 
+class UpdateCredentialsRequest(BaseModel):
+    """Смена логина и/или пароля текущего оператора."""
+    current_password: str
+    new_username: Optional[str] = None
+    new_password: Optional[str] = None
+
+
+class UpdateCredentialsResponse(BaseModel):
+    """Результат обновления учетных данных."""
+    username: str
+    password_changed: bool
+    username_changed: bool
+    access_token: Optional[str] = None
+    token_type: str = "bearer"
+
+
 class MessageCreate(BaseModel):
     """Входящий запрос на создание сообщения."""
     content: str
@@ -135,6 +151,56 @@ class SystemSettingsUpdate(BaseModel):
     business_start: Optional[str] = None
     business_end: Optional[str] = None
     operator_sla_minutes: Optional[int] = None
+
+
+class DatabaseStorageSchema(BaseModel):
+    """Заполненность базы данных относительно лимита провайдера."""
+    size_bytes: int
+    limit_bytes: int
+    usage_percent: float
+    level: str  # ok / warning / critical
+    is_postgres: bool
+    provider_name: str  # Neon / Aiven / PostgreSQL / SQLite
+
+
+class StorageChannelsSchema(BaseModel):
+    """Список уникальных каналов (source) в базе данных."""
+    channels: list[str]
+
+
+class StorageCleanupRequest(BaseModel):
+    """Запрос на удаление неактивных диалогов."""
+    days: int
+    channels_to_delete: list[str]
+    delete_mode: str  # full / messages_only
+
+    @field_validator("days")
+    @classmethod
+    def validate_days(cls, value: int) -> int:
+        if value not in (30, 60, 90):
+            raise ValueError("Период должен быть 30, 60 или 90 дней")
+        return value
+
+    @field_validator("channels_to_delete")
+    @classmethod
+    def validate_channels(cls, value: list[str]) -> list[str]:
+        cleaned = [item.strip() for item in value if item and item.strip()]
+        if not cleaned:
+            raise ValueError("Необходимо выбрать хотя бы один канал")
+        return cleaned
+
+    @field_validator("delete_mode")
+    @classmethod
+    def validate_delete_mode(cls, value: str) -> str:
+        if value not in ("full", "messages_only"):
+            raise ValueError("delete_mode должен быть full или messages_only")
+        return value
+
+
+class StorageCleanupResponse(BaseModel):
+    """Результат очистки неактивных диалогов."""
+    deleted_count: int
+    delete_mode: str
 
 
 class ClientMergeRequest(BaseModel):
