@@ -16,7 +16,7 @@ DEFAULT_POSTGRES_LIMIT_BYTES = NEON_LIMIT_BYTES
 WARNING_THRESHOLD_PERCENT = 90.0
 CRITICAL_THRESHOLD_PERCENT = 95.0
 
-ALLOWED_CLEANUP_DAYS = frozenset({30, 60, 90})
+ALLOWED_CLEANUP_PERIODS = frozenset({30, 60, 90, "all"})
 ALLOWED_DELETE_MODES = frozenset({"full", "messages_only"})
 
 
@@ -85,12 +85,19 @@ async def get_unique_channels(session: AsyncSession) -> list[str]:
     return [row[0] for row in result.all()]
 
 
-async def _get_inactive_conversations(
+async def _get_conversations_for_cleanup(
     session: AsyncSession,
-    days: int,
+    period: int | str,
     channels: list[str],
 ) -> list[Conversation]:
-    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    """Возвращает диалоги для очистки: все (period=all) или неактивные за N дней."""
+    if period == "all":
+        result = await session.execute(
+            select(Conversation).where(Conversation.source.in_(channels))
+        )
+        return result.scalars().all()
+
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=period)
 
     last_msg_sq = (
         select(
@@ -114,13 +121,13 @@ async def _get_inactive_conversations(
 
 async def cleanup_old_conversations(
     session: AsyncSession,
-    days: int,
+    period: int | str,
     channels: list[str],
     delete_mode: str,
 ) -> int:
-    """Удаляет неактивные диалоги или только их сообщения по выбранным каналам."""
-    if days not in ALLOWED_CLEANUP_DAYS:
-        raise ValueError(f"Недопустимый период: {days}")
+    """Удаляет диалоги или только их сообщения по выбранным каналам."""
+    if period not in ALLOWED_CLEANUP_PERIODS:
+        raise ValueError(f"Недопустимый период: {period}")
     if delete_mode not in ALLOWED_DELETE_MODES:
         raise ValueError(f"Недопустимый режим удаления: {delete_mode}")
 
@@ -128,7 +135,7 @@ async def cleanup_old_conversations(
     if not cleaned_channels:
         raise ValueError("Необходимо выбрать хотя бы один канал")
 
-    conversations = await _get_inactive_conversations(session, days, cleaned_channels)
+    conversations = await _get_conversations_for_cleanup(session, period, cleaned_channels)
     if not conversations:
         return 0
 

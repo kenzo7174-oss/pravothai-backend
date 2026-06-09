@@ -6,7 +6,7 @@ Axoloti Terminal — Pydantic-схемы для сериализации дан�
 """
 
 from datetime import datetime
-from typing import Optional, Union
+from typing import Literal, Optional, Union
 from pydantic import BaseModel, ConfigDict, field_validator
 
 
@@ -170,16 +170,20 @@ class StorageChannelsSchema(BaseModel):
 
 class StorageCleanupRequest(BaseModel):
     """Запрос на удаление неактивных диалогов."""
-    days: int
+    period: Union[Literal[30, 60, 90], Literal["all"]]
     channels_to_delete: list[str]
     delete_mode: str  # full / messages_only
 
-    @field_validator("days")
+    @field_validator("period", mode="before")
     @classmethod
-    def validate_days(cls, value: int) -> int:
-        if value not in (30, 60, 90):
-            raise ValueError("Период должен быть 30, 60 или 90 дней")
-        return value
+    def validate_period(cls, value):
+        if value == "all":
+            return "all"
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if value in (30, 60, 90):
+            return value
+        raise ValueError("Период должен быть 30, 60, 90 дней или all")
 
     @field_validator("channels_to_delete")
     @classmethod

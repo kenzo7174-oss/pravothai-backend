@@ -21,7 +21,7 @@ from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Req
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, delete, func, or_, select, text
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
@@ -1398,7 +1398,7 @@ async def cleanup_database_storage(
     """Удаляет неактивные диалоги или сообщения по выбранным каналам. Только для владельца."""
     deleted_count = await cleanup_old_conversations(
         session,
-        body.days,
+        body.period,
         body.channels_to_delete,
         body.delete_mode,
     )
@@ -3326,13 +3326,17 @@ async def delete_conversation(
     _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
-    """Удаляет диалог и все его сообщения. Если у клиента не осталось
+    """Жёстко удаляет диалог и все его сообщения из БД. Если у клиента не осталось
     диалогов — удаляет и самого клиента."""
     conv = await session.get(Conversation, conversation_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     client_id = conv.client_id
+
+    await session.execute(
+        delete(Message).where(Message.conversation_id == conversation_id)
+    )
     await session.delete(conv)
     await session.flush()
 
