@@ -774,6 +774,8 @@ CORS_ORIGINS = [
     "https://axoloti.ru",
     "http://www.axoloti.ru",
     "https://www.axoloti.ru",
+    "https://pravothai.org",
+    "https://www.pravothai.org",
     "http://localhost:5173",   # локальная разработка
 ]
 app.add_middleware(
