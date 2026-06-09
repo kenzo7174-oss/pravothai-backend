@@ -1,14 +1,16 @@
 """
-Сервис генерации черновиков через OpenAI Responses API.
+Сервис генерации ответов через OpenAI Assistants API.
 
-Использует системный промпт (роль продажника Axoloti) и ожидает JSON-ответ
+Ассистент настроен в OpenAI Dashboard; ожидается JSON-ответ
 вида { "message": "...", "request_operator": false }.
 """
 
+import asyncio
 import io
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone, timedelta
 from typing import TYPE_CHECKING
 
@@ -89,19 +91,19 @@ async def transcribe_voice(audio_data: bytes, filename: str = "voice.ogg") -> st
     return None
 
 
-def _extract_text_from_response(response) -> str | None:
-    """Извлекает сырой текст ответа из output."""
-    message_text: str | None = None
-    for item in getattr(response, "output", []) or []:
-        if getattr(item, "type", None) == "message":
-            for content in getattr(item, "content", []):
-                if getattr(content, "type", None) == "output_text":
-                    text = getattr(content, "text", None) or ""
-                    if text.strip():
-                        message_text = (message_text or "") + text
-    if message_text is None and getattr(response, "output_text", None):
-        message_text = response.output_text.strip() or None
-    return message_text
+RUN_TIMEOUT_SECONDS = 120
+RUN_POLL_INTERVAL_SECONDS = 0.5
+
+
+def _extract_assistant_message_text(message) -> str | None:
+    """Извлекает текст из сообщения ассистента в треде."""
+    parts: list[str] = []
+    for block in getattr(message, "content", []) or []:
+        if getattr(block, "type", None) == "text":
+            text = getattr(getattr(block, "text", None), "value", None) or ""
+            if text.strip():
+                parts.append(text.strip())
+    return "\n".join(parts).strip() or None
 
 
 def _parse_json_response(text: str) -> tuple[str | None, bool]:
@@ -127,21 +129,17 @@ def _parse_json_response(text: str) -> tuple[str | None, bool]:
     return None, False
 
 
-def _parse_response_output(response, use_json_format: bool = True) -> tuple[str | None, bool]:
-    """Извлекает текст ответа и флаг request_operator. Поддерживает JSON-формат.
-    Гарантия: если в ответе есть фраза перевода на специалиста — принудительно request_operator=True."""
-    text = _extract_text_from_response(response)
+def _parse_assistant_output(text: str | None, use_json_format: bool = True) -> tuple[str | None, bool]:
+    """Парсит текст ответа ассистента и флаг request_operator."""
     if not text:
         return None, False
 
     if use_json_format:
         message_text, request_operator = _parse_json_response(text)
         if message_text is not None:
-            # Гарантия: ИИ сказал «Перевожу... специалиста» — блокируем, даже если забыл request_operator
             if TRANSFER_PHRASE_MARKER in message_text and "специалиста" in message_text:
                 request_operator = True
             return message_text, request_operator
-        # Fallback: если JSON не распарсился, используем весь текст как сообщение
         raw = text.strip()
         force_transfer = TRANSFER_PHRASE_MARKER in raw and "специалиста" in raw
         return raw, force_transfer
@@ -149,6 +147,149 @@ def _parse_response_output(response, use_json_format: bool = True) -> tuple[str 
     raw = text.strip()
     force_transfer = TRANSFER_PHRASE_MARKER in raw and "специалиста" in raw
     return raw, force_transfer
+
+
+def _get_assistant_id() -> str | None:
+    return settings.OPENAI_ASSISTANT_ID
+
+
+async def _wait_for_run(client: AsyncOpenAI, thread_id: str, run_id: str):
+    """Ожидает завершения Run в треде Assistants API."""
+    deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
+    while True:
+        run = await client.beta.threads.runs.retrieve(thread_id=thread_id, run_id=run_id)
+        if run.status in ("completed", "failed", "cancelled", "expired", "incomplete"):
+            return run
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"OpenAI run {run_id} timed out after {RUN_TIMEOUT_SECONDS}s")
+        await asyncio.sleep(RUN_POLL_INTERVAL_SECONDS)
+
+
+async def _fetch_latest_assistant_reply(client: AsyncOpenAI, thread_id: str) -> str | None:
+    """Возвращает текст последнего сообщения ассистента в треде."""
+    messages = await client.beta.threads.messages.list(
+        thread_id=thread_id,
+        order="desc",
+        limit=10,
+    )
+    for message in messages.data:
+        if message.role == "assistant":
+            return _extract_assistant_message_text(message)
+    return None
+
+
+async def generate_assistant_reply(
+    message: str,
+    thread_id: str | None = None,
+    additional_instructions: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Генерирует ответ через Assistants API.
+
+    Принимает message и опциональный OpenAI thread_id.
+    Если thread_id нет — создаёт новый тред, добавляет сообщение, запускает Run
+    и возвращает (текст ответа, thread_id).
+    """
+    api_key = settings.OPENAI_API_KEY
+    assistant_id = _get_assistant_id()
+    text = (message or "").strip()
+
+    if not api_key:
+        log.warning("OPENAI_API_KEY не задан — генерация невозможна")
+        return None, thread_id
+    if not assistant_id:
+        log.warning("OPENAI_ASSISTANT_ID не задан — генерация невозможна")
+        return None, thread_id
+    if not text:
+        log.warning("Пустое сообщение для Assistants API")
+        return None, thread_id
+
+    try:
+        client = AsyncOpenAI(api_key=api_key)
+
+        if thread_id:
+            openai_thread_id = thread_id
+        else:
+            thread = await client.beta.threads.create()
+            openai_thread_id = thread.id
+
+        await client.beta.threads.messages.create(
+            thread_id=openai_thread_id,
+            role="user",
+            content=text,
+        )
+
+        run_kwargs: dict = {
+            "thread_id": openai_thread_id,
+            "assistant_id": assistant_id,
+        }
+        if additional_instructions:
+            run_kwargs["additional_instructions"] = additional_instructions
+
+        run = await client.beta.threads.runs.create(**run_kwargs)
+        run = await _wait_for_run(client, openai_thread_id, run.id)
+
+        if run.status != "completed":
+            log.error(
+                "OpenAI Assistants run failed: status=%s error=%s",
+                run.status,
+                getattr(run, "last_error", None),
+            )
+            return None, openai_thread_id
+
+        reply = await _fetch_latest_assistant_reply(client, openai_thread_id)
+        return reply, openai_thread_id
+
+    except APIError as exc:
+        log.error("OpenAI Assistants API error: %s", exc)
+    except TimeoutError as exc:
+        log.error("%s", exc)
+    except Exception as exc:
+        log.error("Непредвиденная ошибка Assistants API: %s", exc)
+
+    return None, thread_id
+
+
+async def _run_assistant_on_history(
+    history: list[tuple[str, str]],
+    additional_instructions: str | None = None,
+) -> str | None:
+    """Создаёт тред, загружает историю сообщений и возвращает сырой ответ ассистента."""
+    api_key = settings.OPENAI_API_KEY
+    assistant_id = _get_assistant_id()
+    if not api_key or not assistant_id or not history:
+        return None
+
+    client = AsyncOpenAI(api_key=api_key)
+    thread = await client.beta.threads.create()
+
+    for role, content in history:
+        if not (content or "").strip():
+            continue
+        await client.beta.threads.messages.create(
+            thread_id=thread.id,
+            role=role,
+            content=content.strip(),
+        )
+
+    run_kwargs: dict = {
+        "thread_id": thread.id,
+        "assistant_id": assistant_id,
+    }
+    if additional_instructions:
+        run_kwargs["additional_instructions"] = additional_instructions
+
+    run = await client.beta.threads.runs.create(**run_kwargs)
+    run = await _wait_for_run(client, thread.id, run.id)
+
+    if run.status != "completed":
+        log.error(
+            "OpenAI Assistants run failed: status=%s error=%s",
+            run.status,
+            getattr(run, "last_error", None),
+        )
+        return None
+
+    return await _fetch_latest_assistant_reply(client, thread.id)
 
 
 def _parse_time(s: str) -> tuple[int, int] | None:
@@ -239,36 +380,34 @@ async def generate_draft(
     session: "AsyncSession | None" = None,
     override_instructions: str | None = None,
 ) -> tuple[str | None, bool]:
-    """Генерирует черновик ответа на основе истории диалога через OpenAI Responses API.
+    """Генерирует черновик ответа на основе истории диалога через OpenAI Assistants API.
 
     Принимает последние N ORM-объектов Message,
     возвращает (текст сообщения, request_operator) или (None, False) при ошибке.
     override_instructions: при задании подменяет инструкции и отключает request_human_operator.
     """
-    api_key = settings.OPENAI_API_KEY
-    prompt_id = settings.OPENAI_RESPONSE_ID
-    if not api_key:
+    if not settings.OPENAI_API_KEY:
         log.warning("OPENAI_API_KEY не задан — генерация невозможна")
         return None, False
-    if not prompt_id:
-        log.warning("OPENAI_RESPONSE_ID / OPENAI_ASSISTANT_ID не задан — генерация невозможна")
+    if not _get_assistant_id():
+        log.warning("OPENAI_ASSISTANT_ID не задан — генерация невозможна")
         return None, False
 
-    # ИИ реагирует ТОЛЬКО на сообщения клиента/оператора/бота. Системные — исключаем.
     filtered = [m for m in messages if m.sender != "system"]
     if not filtered:
         log.warning("Нет сообщений для ИИ после исключения системных")
         return None, False
-    input_items = [
-        {"role": SENDER_TO_ROLE.get(msg.sender, "user"), "content": msg.content}
+
+    history = [
+        (SENDER_TO_ROLE.get(msg.sender, "user"), msg.content)
         for msg in filtered
     ]
 
-    instructions = SYSTEM_PROMPT
+    additional_instructions: str | None = None
     use_json_format = True
 
     if override_instructions:
-        instructions = override_instructions
+        additional_instructions = override_instructions
         use_json_format = False
     elif session:
         result = await session.execute(select(SystemSettings).where(SystemSettings.id == 1))
@@ -277,25 +416,17 @@ async def generate_draft(
             start = getattr(sys_settings, "business_start", "09:00") or "09:00"
             end = getattr(sys_settings, "business_end", "18:00") or "18:00"
             if not _is_within_business_hours(start, end):
-                instructions = SYSTEM_PROMPT + "\n\n" + OFF_HOURS_INSTRUCTION
-
-    create_params: dict = {
-        "prompt": {"id": prompt_id},
-        "instructions": instructions,
-        "input": input_items,
-        "tools": [],
-        "store": False,
-    }
+                additional_instructions = OFF_HOURS_INSTRUCTION
 
     try:
-        client = AsyncOpenAI(api_key=api_key)
-        response = await client.responses.create(**create_params)
-
-        message_text, request_operator = _parse_response_output(response, use_json_format=use_json_format)
-        return message_text, request_operator
+        raw_reply = await _run_assistant_on_history(
+            history,
+            additional_instructions=additional_instructions,
+        )
+        return _parse_assistant_output(raw_reply, use_json_format=use_json_format)
 
     except APIError as exc:
-        log.error("OpenAI Responses API error: %s", exc)
+        log.error("OpenAI Assistants API error: %s", exc)
     except Exception as exc:
         log.error("Непредвиденная ошибка при генерации черновика: %s", exc)
 
