@@ -123,7 +123,13 @@ logging.basicConfig(
 class _SuppressPollingFilter(logging.Filter):
     """Drop INFO access-log records for the high-frequency polling endpoint."""
 
-    _NOISY_FRAGMENTS = ("GET /api/v1/clients ", "GET /api/v1/health ", "GET /api/v1/webhooks/web/", "GET /api/v1/events/stream")
+    _NOISY_FRAGMENTS = (
+        "GET /api/v1/clients ",
+        "GET /api/v1/health ",
+        "GET /api/v1/webhooks/web/",
+        "GET /api/v1/webhooks/web/stream",
+        "GET /api/v1/events/stream",
+    )
 
     def filter(self, record: logging.LogRecord) -> bool:
         if record.levelno > logging.INFO:
@@ -2796,6 +2802,118 @@ def _parse_operator_from_internal_message(text: str) -> dict | None:
     if m:
         return {"name": m.group(1).strip(), "role": m.group(2).strip()}
     return None
+
+
+def _normalize_widget_sender(sender: str) -> str:
+    """Приводит sender к формату виджета: operator / bot / system."""
+    if sender in ("support", "operator"):
+        return "operator"
+    if sender in ("assistant", "bot"):
+        return "bot"
+    return sender
+
+
+async def _resolve_web_conversation_by_client_id(session, client_id: str):
+    """Ищет клиента по axolotl_visitor_id и его активный web-диалог."""
+    visitor_id = (client_id or "").strip()
+    if not visitor_id:
+        return None, None, HTTPException(status_code=400, detail="client_id is required")
+
+    result = await session.execute(
+        select(Client).where(Client.axolotl_visitor_id == visitor_id)
+    )
+    client = result.scalars().first()
+    if client is None:
+        return None, None, HTTPException(status_code=404, detail="Client not found")
+
+    result = await session.execute(
+        select(Conversation)
+        .where(
+            Conversation.source == "web",
+            Conversation.client_id == client.id,
+        )
+        .order_by(Conversation.last_interaction_at.desc())
+    )
+    conv = result.scalars().first()
+    if conv is None:
+        return None, None, HTTPException(status_code=404, detail="Conversation not found")
+
+    return client, conv, None
+
+
+WEB_WIDGET_SSE_SENDERS = frozenset({"operator", "bot", "system", "support", "assistant"})
+
+
+@app.get("/api/v1/webhooks/web/stream")
+async def web_widget_sse_stream(
+    request: Request,
+    client_id: str = Query(..., description="axolotl_visitor_id посетителя"),
+):
+    """SSE-поток для веб-виджета: доставляет непрочитанные ответы оператора/бота/системы."""
+    from fastapi.responses import StreamingResponse
+
+    async with AsyncSessionLocal() as session:
+        _, conv, err = await _resolve_web_conversation_by_client_id(session, client_id)
+        if err is not None:
+            raise err
+        conv_id = conv.id
+
+    async def event_generator():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                async with AsyncSessionLocal() as session:
+                    result = await session.execute(
+                        select(Message)
+                        .where(
+                            Message.conversation_id == conv_id,
+                            Message.is_read == False,
+                            Message.sender.in_(WEB_WIDGET_SSE_SENDERS),
+                            or_(Message.is_internal == False, Message.is_internal.is_(None)),
+                        )
+                        .order_by(Message.created_at.asc())
+                    )
+                    messages = result.scalars().all()
+
+                    for msg in messages:
+                        if await request.is_disconnected():
+                            return
+
+                        sender = _normalize_widget_sender(msg.sender)
+                        if sender not in {"operator", "bot", "system"}:
+                            continue
+
+                        payload = json.dumps(
+                            {"text": msg.content, "sender": sender},
+                            ensure_ascii=False,
+                        )
+                        yield f"data: {payload}\n\n"
+                        msg.is_read = True
+
+                    if messages:
+                        await session.commit()
+
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            log.info(
+                "web widget SSE stream closed client_id=%s conv_id=%s",
+                client_id,
+                conv_id,
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/api/v1/webhooks/web/{thread_id}")

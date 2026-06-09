@@ -1,8 +1,14 @@
 """
-Сервис генерации ответов через OpenAI Assistants API.
+Универсальный сервис генерации ответов через OpenAI.
 
-Ассистент настроен в OpenAI Dashboard; ожидается JSON-ответ
-вида { "message": "...", "request_operator": false }.
+Режим выбирается по переменным окружения:
+- OPENAI_ASSISTANT_ID задан → Assistants API (client.beta.assistants...)
+- OPENAI_ASSISTANT_ID не задан → Chat Completions API (client.chat.completions.create)
+
+В режиме Chat Completions системный промпт берётся из OPENAI_SYSTEM_PROMPT
+или из DEFAULT_SYSTEM_PROMPT ниже.
+
+Ожидается JSON-ответ вида { "message": "...", "request_operator": false }.
 """
 
 import asyncio
@@ -31,7 +37,7 @@ TRANSFER_PHRASE_MARKER = "Перевожу"
 
 OFF_HOURS_INSTRUCTION = """Сейчас нерабочее время. ПРАВИЛО: Никак не упоминай рабочее время и отсутствие людей, общайся как обычно. В JSON используй "request_operator": false, ИСКЛЮЧЕНИЕ: если клиент прямо просит оператора/специалиста — отвечай фразой "Перевожу вас на специалиста, одну минуту..." и ставь "request_operator": true."""
 
-SYSTEM_PROMPT = """БАЗА ЗНАНИЙ: Axoloti Terminal (LiveDesk)
+DEFAULT_SYSTEM_PROMPT = """БАЗА ЗНАНИЙ: Axoloti Terminal (LiveDesk)
 РОЛЬ И ЦЕЛЬ: Ты — проактивный ИИ-менеджер по продажам платформы Axoloti (робот-аксолотль). Твоя цель: продавать внедрение умного чата и переводить горячих лидов на оператора.
 СТРОГОЕ ПРАВИЛО: Ты продаешь IT-продукт. Никогда не предлагай помощь с документами или возвратами.
 
@@ -153,6 +159,70 @@ def _get_assistant_id() -> str | None:
     return settings.OPENAI_ASSISTANT_ID
 
 
+def _uses_assistants_api() -> bool:
+    """True, если задан OPENAI_ASSISTANT_ID — используем Assistants API."""
+    return bool(_get_assistant_id())
+
+
+def _get_system_prompt() -> str:
+    """Системный промпт для Chat Completions: env или встроенный по умолчанию."""
+    custom = settings.OPENAI_SYSTEM_PROMPT
+    if custom and custom.strip():
+        return custom.strip()
+    return DEFAULT_SYSTEM_PROMPT
+
+
+def _get_chat_model() -> str:
+    return settings.OPENAI_CHAT_MODEL or "gpt-4o"
+
+
+def _build_chat_messages(
+    history: list[tuple[str, str]],
+    additional_instructions: str | None = None,
+) -> list[dict[str, str]]:
+    """Собирает messages для Chat Completions API."""
+    system_content = _get_system_prompt()
+    if additional_instructions:
+        system_content = f"{system_content}\n\n{additional_instructions}"
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_content}]
+    for role, content in history:
+        if (content or "").strip():
+            messages.append({"role": role, "content": content.strip()})
+    return messages
+
+
+async def _run_chat_on_history(
+    history: list[tuple[str, str]],
+    additional_instructions: str | None = None,
+) -> str | None:
+    """Генерирует ответ через Chat Completions API по истории сообщений."""
+    api_key = settings.OPENAI_API_KEY
+    if not api_key or not history:
+        return None
+
+    client = AsyncOpenAI(api_key=api_key)
+    response = await client.chat.completions.create(
+        model=_get_chat_model(),
+        messages=_build_chat_messages(history, additional_instructions),
+        temperature=0.7,
+    )
+    return (response.choices[0].message.content or "").strip() or None
+
+
+async def _generate_chat_reply(
+    message: str,
+    additional_instructions: str | None = None,
+) -> str | None:
+    """Одно сообщение через Chat Completions API."""
+    text = (message or "").strip()
+    if not text:
+        return None
+    return await _run_chat_on_history(
+        [("user", text)],
+        additional_instructions=additional_instructions,
+    )
+
+
 async def _wait_for_run(client: AsyncOpenAI, thread_id: str, run_id: str):
     """Ожидает завершения Run в треде Assistants API."""
     deadline = time.monotonic() + RUN_TIMEOUT_SECONDS
@@ -183,26 +253,35 @@ async def generate_assistant_reply(
     thread_id: str | None = None,
     additional_instructions: str | None = None,
 ) -> tuple[str | None, str | None]:
-    """Генерирует ответ через Assistants API.
+    """Генерирует ответ через OpenAI (Assistants API или Chat Completions).
 
-    Принимает message и опциональный OpenAI thread_id.
+    Assistants API: принимает message и опциональный OpenAI thread_id.
     Если thread_id нет — создаёт новый тред, добавляет сообщение, запускает Run
     и возвращает (текст ответа, thread_id).
+
+    Chat Completions: thread_id не используется, возвращает (текст, None).
     """
     api_key = settings.OPENAI_API_KEY
-    assistant_id = _get_assistant_id()
     text = (message or "").strip()
 
     if not api_key:
         log.warning("OPENAI_API_KEY не задан — генерация невозможна")
         return None, thread_id
-    if not assistant_id:
-        log.warning("OPENAI_ASSISTANT_ID не задан — генерация невозможна")
-        return None, thread_id
     if not text:
-        log.warning("Пустое сообщение для Assistants API")
+        log.warning("Пустое сообщение для OpenAI")
         return None, thread_id
 
+    if not _uses_assistants_api():
+        try:
+            reply = await _generate_chat_reply(text, additional_instructions=additional_instructions)
+            return reply, None
+        except APIError as exc:
+            log.error("OpenAI Chat Completions API error: %s", exc)
+        except Exception as exc:
+            log.error("Непредвиденная ошибка Chat Completions API: %s", exc)
+        return None, thread_id
+
+    assistant_id = _get_assistant_id()
     try:
         client = AsyncOpenAI(api_key=api_key)
 
@@ -253,12 +332,15 @@ async def _run_assistant_on_history(
     history: list[tuple[str, str]],
     additional_instructions: str | None = None,
 ) -> str | None:
-    """Создаёт тред, загружает историю сообщений и возвращает сырой ответ ассистента."""
+    """Генерирует сырой ответ по истории сообщений (Assistants API или Chat Completions)."""
     api_key = settings.OPENAI_API_KEY
-    assistant_id = _get_assistant_id()
-    if not api_key or not assistant_id or not history:
+    if not api_key or not history:
         return None
 
+    if not _uses_assistants_api():
+        return await _run_chat_on_history(history, additional_instructions=additional_instructions)
+
+    assistant_id = _get_assistant_id()
     client = AsyncOpenAI(api_key=api_key)
     thread = await client.beta.threads.create()
 
@@ -380,17 +462,15 @@ async def generate_draft(
     session: "AsyncSession | None" = None,
     override_instructions: str | None = None,
 ) -> tuple[str | None, bool]:
-    """Генерирует черновик ответа на основе истории диалога через OpenAI Assistants API.
+    """Генерирует черновик ответа на основе истории диалога через OpenAI.
 
+    Режим API определяется наличием OPENAI_ASSISTANT_ID в окружении.
     Принимает последние N ORM-объектов Message,
     возвращает (текст сообщения, request_operator) или (None, False) при ошибке.
     override_instructions: при задании подменяет инструкции и отключает request_human_operator.
     """
     if not settings.OPENAI_API_KEY:
         log.warning("OPENAI_API_KEY не задан — генерация невозможна")
-        return None, False
-    if not _get_assistant_id():
-        log.warning("OPENAI_ASSISTANT_ID не задан — генерация невозможна")
         return None, False
 
     filtered = [m for m in messages if m.sender != "system"]
@@ -426,7 +506,8 @@ async def generate_draft(
         return _parse_assistant_output(raw_reply, use_json_format=use_json_format)
 
     except APIError as exc:
-        log.error("OpenAI Assistants API error: %s", exc)
+        api_mode = "Assistants" if _uses_assistants_api() else "Chat Completions"
+        log.error("OpenAI %s API error: %s", api_mode, exc)
     except Exception as exc:
         log.error("Непредвиденная ошибка при генерации черновика: %s", exc)
 
