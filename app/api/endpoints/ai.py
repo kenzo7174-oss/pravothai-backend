@@ -5,12 +5,13 @@ Axoloti Terminal — AI endpoints (summaries, etc.).
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
-from openai import AsyncOpenAI, APIError
+from openai import APIError
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.auth import get_current_operator
 from app.core.database import get_session
+from app.services.openai_service import get_openai_client
 from app.models import Client, Conversation, Message, Operator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -74,8 +75,11 @@ async def generate_client_summary(
 
     prompt = _format_messages_for_prompt(all_messages)
 
+    openai_client = get_openai_client()
+    if openai_client is None:
+        raise HTTPException(status_code=503, detail="AI disabled")
+
     try:
-        openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         response = await openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[

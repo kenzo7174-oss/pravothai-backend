@@ -110,6 +110,10 @@ async def set_telegram_webhook(webhook_url: str) -> dict | None:
         "allowed_updates": ["message", "edited_message"],
         "drop_pending_updates": False,
     }
+    # Секрет: Telegram будет слать его в заголовке X-Telegram-Bot-Api-Secret-Token,
+    # бэкенд проверяет его в обработчике вебхука.
+    if settings.TELEGRAM_WEBHOOK_SECRET:
+        payload["secret_token"] = settings.TELEGRAM_WEBHOOK_SECRET
     response = await _telegram_api_post("setWebhook", payload)
     if response is None:
         return None

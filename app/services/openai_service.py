@@ -15,6 +15,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -31,6 +32,34 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
+
+# Таймаут на каждый HTTP-вызов к OpenAI и число ретраев.
+# Защищает синхронные пути (например, вебхук виджета) от зависаний на минуты.
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "1"))
+
+_openai_client: "AsyncOpenAI | None" = None
+_openai_client_key: str | None = None
+
+
+def get_openai_client() -> "AsyncOpenAI | None":
+    """Возвращает переиспользуемый AsyncOpenAI-клиент с заданным таймаутом.
+
+    Кэшируется по api_key (пересоздаётся при смене ключа). None, если ключ не задан.
+    """
+    global _openai_client, _openai_client_key
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        return None
+    if _openai_client is None or _openai_client_key != api_key:
+        _openai_client = AsyncOpenAI(
+            api_key=api_key,
+            timeout=OPENAI_TIMEOUT_SECONDS,
+            max_retries=OPENAI_MAX_RETRIES,
+        )
+        _openai_client_key = api_key
+    return _openai_client
+
 
 # Фраза перевода — при её появлении в ответе ИИ сервер принудительно блокирует ИИ
 TRANSFER_PHRASE_MARKER = "Перевожу"
@@ -73,7 +102,9 @@ async def transcribe_voice(audio_data: bytes, filename: str = "voice.ogg") -> st
         return None
 
     try:
-        client = AsyncOpenAI(api_key=api_key)
+        client = get_openai_client()
+        if client is None:
+            return None
         audio_file = io.BytesIO(audio_data)
         audio_file.name = filename
 
@@ -107,6 +138,7 @@ def _extract_assistant_message_text(message) -> str | None:
     for block in getattr(message, "content", []) or []:
         if getattr(block, "type", None) == "text":
             text = getattr(getattr(block, "text", None), "value", None) or ""
+            text = re.sub(r'【[^】]*】', '', text)
             if text.strip():
                 parts.append(text.strip())
     return "\n".join(parts).strip() or None
@@ -196,11 +228,10 @@ async def _run_chat_on_history(
     additional_instructions: str | None = None,
 ) -> str | None:
     """Генерирует ответ через Chat Completions API по истории сообщений."""
-    api_key = settings.OPENAI_API_KEY
-    if not api_key or not history:
+    client = get_openai_client()
+    if client is None or not history:
         return None
 
-    client = AsyncOpenAI(api_key=api_key)
     response = await client.chat.completions.create(
         model=_get_chat_model(),
         messages=_build_chat_messages(history, additional_instructions),
@@ -283,7 +314,9 @@ async def generate_assistant_reply(
 
     assistant_id = _get_assistant_id()
     try:
-        client = AsyncOpenAI(api_key=api_key)
+        client = get_openai_client()
+        if client is None:
+            return None, thread_id
 
         if thread_id:
             openai_thread_id = thread_id
@@ -341,7 +374,9 @@ async def _run_assistant_on_history(
         return await _run_chat_on_history(history, additional_instructions=additional_instructions)
 
     assistant_id = _get_assistant_id()
-    client = AsyncOpenAI(api_key=api_key)
+    client = get_openai_client()
+    if client is None:
+        return None
     thread = await client.beta.threads.create()
 
     for role, content in history:
@@ -593,12 +628,11 @@ async def auto_tag_conversation(conversation_id: int) -> None:
             if not dialog_text.strip():
                 return
 
-            api_key = settings.OPENAI_API_KEY
-            if not api_key:
+            client = get_openai_client()
+            if client is None:
                 log.warning("OPENAI_API_KEY не задан — авто-тегирование пропущено")
                 return
 
-            client = AsyncOpenAI(api_key=api_key)
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[

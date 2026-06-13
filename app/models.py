@@ -165,6 +165,9 @@ class Message(Base):
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
     is_voice: Mapped[bool] = mapped_column(Boolean, default=False)
     is_internal: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
+    is_exported_to_tg: Mapped[bool] = mapped_column(Boolean, default=False)
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
 
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 

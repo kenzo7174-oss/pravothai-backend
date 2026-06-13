@@ -7,10 +7,13 @@ Axoloti Terminal — Главный файл FastAPI-приложения.
 """
 
 import asyncio
+import hmac
 import json
 import logging
+import os
 import random
 import re
+import time
 import uuid
 from collections import defaultdict
 from contextlib import asynccontextmanager
@@ -26,7 +29,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 import uvicorn
 
-from app.core.config import settings
+from app.core.config import settings, assert_production_secrets
 from app.core.database import engine, get_session, is_postgres, Base, AsyncSessionLocal
 from app.core.auth import (
     hash_password,
@@ -108,6 +111,9 @@ from app.services.push_service import (
     push_specialist_requested,
     schedule_push,
 )
+# === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
+from app.services.thai_legal_tg_export import thai_legal_tg_export_loop
+# === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
 from jose import JWTError, jwt
@@ -324,6 +330,18 @@ async def ensure_conversation_runtime_columns() -> None:
             await conn.execute(text(
                 f"ALTER TABLE messages ADD COLUMN is_voice BOOLEAN NOT NULL DEFAULT {default_val}"
             ))
+
+        # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
+        if "is_exported_to_tg" not in msg_columns:
+            default_val = "0" if not is_postgres() else "false"
+            try:
+                await conn.execute(text(
+                    f"ALTER TABLE messages ADD COLUMN is_exported_to_tg BOOLEAN DEFAULT {default_val}"
+                ))
+            except Exception as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
 
         # clients.notes (для заметок оператора)
         client_columns = await _get_table_columns(conn, "clients")
@@ -640,7 +658,8 @@ async def seed_default_operator() -> None:
             ))
 
     owner_link = "https://axolotl-backend.onrender.com"
-    owner_password = "123456"
+    # Пароль для первичного посева берётся из окружения (в проде обязателен, см. assert_production_secrets).
+    owner_password = settings.DEFAULT_ADMIN_PASSWORD
     async with AsyncSessionLocal() as session:
         result = await session.execute(select(Operator).limit(1))
         if result.scalar_one_or_none() is None:
@@ -655,7 +674,9 @@ async def seed_default_operator() -> None:
             await session.commit()
             log.info("Seeded default operator (owner): %s link=%s", username, owner_link)
         else:
-            # Принудительно обновить link и пароль для главного Владельца
+            # Обновляем только link/роль/активность владельца.
+            # ВАЖНО: пароль НЕ перезаписываем — иначе смена пароля владельцем
+            # откатывалась бы на каждом рестарте. Для сброса есть scripts/reset_owner_password.py.
             result = await session.execute(
                 select(Operator)
                 .where(
@@ -673,12 +694,10 @@ async def seed_default_operator() -> None:
                 admin = result.scalar_one_or_none()
             if admin:
                 admin.link = owner_link
-                admin.hashed_password = hash_password(owner_password)
-                admin.needs_password_setup = False
                 admin.role = "owner"
                 admin.is_active = True
                 await session.commit()
-                log.info("Updated owner link and password: %s link=%s", admin.username, owner_link)
+                log.info("Ensured owner link/role/active: %s link=%s", admin.username, owner_link)
 
 
 async def ensure_first_operator_is_owner() -> None:
@@ -734,6 +753,7 @@ async def ensure_first_operator_is_owner() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    assert_production_secrets()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await ensure_conversation_runtime_columns()
@@ -744,8 +764,18 @@ async def lifespan(app: FastAPI):
     sla_task = asyncio.create_task(sla_monitor_loop())
     auto_ai_task = asyncio.create_task(_auto_ai_return_loop())
     broadcast_scheduler_task = asyncio.create_task(_scheduled_broadcast_loop())
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
+    thai_legal_tg_export_task = asyncio.create_task(thai_legal_tg_export_loop())
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
     log.info("FastAPI startup complete")
     yield
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
+    thai_legal_tg_export_task.cancel()
+    try:
+        await thai_legal_tg_export_task
+    except asyncio.CancelledError:
+        pass
+    # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
     broadcast_scheduler_task.cancel()
     try:
         await broadcast_scheduler_task
@@ -1410,7 +1440,10 @@ async def cleanup_database_storage(
 # ═══════════════════════════════════════════════════════════════════════════
 
 @app.get("/api/v1/clients", response_model=list[ClientSchema])
-async def get_clients(session: AsyncSession = Depends(get_session)):
+async def get_clients(
+    _operator: Operator = Depends(get_current_operator),
+    session: AsyncSession = Depends(get_session),
+):
     """
     Возвращает список всех клиентов с диалогами и сообщениями.
 
@@ -1443,6 +1476,7 @@ async def get_clients(session: AsyncSession = Depends(get_session)):
 @app.get("/api/v1/clients/{client_id}", response_model=ClientSchema)
 async def get_client(
     client_id: int,
+    _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Возвращает одного клиента с диалогами (для подтягивания актуальных тегов и заметок при открытии чата)."""
@@ -1675,15 +1709,39 @@ async def _run_broadcast_task(text: str, recipients: list[dict]) -> None:
         await session.commit()
 
 
+# Rate-limit рассылок: не более BROADCAST_RATE_LIMIT запусков на оператора за окно (сек).
+BROADCAST_RATE_LIMIT = int(os.getenv("BROADCAST_RATE_LIMIT", "5"))
+BROADCAST_RATE_WINDOW_SEC = int(os.getenv("BROADCAST_RATE_WINDOW_SEC", "60"))
+_broadcast_calls: dict[int, list[float]] = {}
+
+
+def _check_broadcast_rate_limit(operator_id: int) -> None:
+    """In-memory троттлинг запусков рассылки. Бросает 429 при превышении."""
+    now = time.monotonic()
+    window_start = now - BROADCAST_RATE_WINDOW_SEC
+    calls = [t for t in _broadcast_calls.get(operator_id, []) if t > window_start]
+    if len(calls) >= BROADCAST_RATE_LIMIT:
+        retry_after = int(BROADCAST_RATE_WINDOW_SEC - (now - calls[0])) + 1
+        raise HTTPException(
+            status_code=429,
+            detail=f"Слишком много рассылок. Повторите через {max(1, retry_after)} с.",
+            headers={"Retry-After": str(max(1, retry_after))},
+        )
+    calls.append(now)
+    _broadcast_calls[operator_id] = calls
+
+
 @app.post("/api/v1/broadcast")
 async def start_broadcast(
     body: BroadcastRequest,
     background_tasks: BackgroundTasks,
-    _: Operator = Depends(get_current_operator),
+    operator: Operator = Depends(get_current_operator),
 ):
     """
     Запускает рассылку в фоне. Принимает text и recipients — список {client_id, source}.
     """
+    _check_broadcast_rate_limit(operator.id)
+
     text = (body.text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -1702,12 +1760,15 @@ async def start_broadcast(
 
     # Запланировать: сохраняем в ScheduledBroadcast (naive UTC для SQLite)
     dt = scheduled_at
-    if hasattr(dt, "tzinfo") and dt.tzinfo is not None:
-        dt = (dt.astimezone(timezone.utc)).replace(tzinfo=None)
-    elif isinstance(dt, str):
-        dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-        if dt.tzinfo:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    try:
+        if hasattr(dt, "tzinfo") and dt.tzinfo is not None:
+            dt = (dt.astimezone(timezone.utc)).replace(tzinfo=None)
+        elif isinstance(dt, str):
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Некорректный формат scheduled_at")
 
     async with AsyncSessionLocal() as session:
         sb = ScheduledBroadcast(
@@ -2437,6 +2498,7 @@ async def assign_conversation(
 @app.post("/api/v1/conversations/{conversation_id}/generate-draft")
 async def generate_draft_endpoint(
     conversation_id: int,
+    _operator: Operator = Depends(get_current_operator),
     session: AsyncSession = Depends(get_session),
 ):
     """Генерирует черновик ответа через OpenAI на основе последних сообщений."""
@@ -2636,8 +2698,15 @@ async def telegram_webhook(
     Отвечает 200 OK мгновенно, чтобы Telegram не повторял запрос из-за таймаута.
     Вся тяжёлая логика выполняется в фоне (process_telegram_task).
     """
+    # Валидация секрета: если TELEGRAM_WEBHOOK_SECRET задан — заголовок обязателен и должен совпасть.
+    if settings.TELEGRAM_WEBHOOK_SECRET:
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not hmac.compare_digest(provided, settings.TELEGRAM_WEBHOOK_SECRET):
+            log.warning("telegram_webhook: неверный secret token, запрос отклонён")
+            raise HTTPException(status_code=403, detail="Forbidden")
+
     raw_body = await request.body()
-    log.info("⚡ INCOMING TELEGRAM WEBHOOK: %s", raw_body.decode("utf-8", errors="replace"))
+    log.debug("Incoming telegram webhook: %d bytes", len(raw_body))
 
     try:
         update_data = json.loads(raw_body)
