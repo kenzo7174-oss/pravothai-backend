@@ -8,6 +8,7 @@ URL задаётся через переменную окружения DATABASE
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
+from sqlalchemy.pool import NullPool
 
 DATABASE_URL = os.getenv(
     "DATABASE_URL",
@@ -22,16 +23,21 @@ _engine_kwargs: dict = {"echo": False}
 if _is_sqlite:
     _connect_args["check_same_thread"] = False
 else:
-    # PostgreSQL (Neon): защита от «протухших»/закрытых по простою соединений.
-    # pool_pre_ping проверяет соединение перед выдачей; pool_recycle пересоздаёт
-    # его раньше, чем сервер успеет закрыть idle-коннект.
-    _engine_kwargs.update(
-        pool_pre_ping=True,
-        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "300")),
-        pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
-        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
-        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
-    )
+    # Проверяем, нужно ли экономить лимиты (режим NullPool)
+    use_null_pool = os.getenv("USE_NULL_POOL", "false").lower() == "true"
+    
+    if use_null_pool:
+        _engine_kwargs["poolclass"] = NullPool
+    else:
+        # Стандартный пул для высоких нагрузок (Axoloti Terminal)
+        _engine_kwargs.update(
+            pool_pre_ping=True,
+            pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "300")),
+            pool_size=int(os.getenv("DB_POOL_SIZE", "5")),
+            max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "10")),
+            pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "30")),
+        )
+
     # asyncpg: таймаут установления соединения и таймаут команды.
     if "asyncpg" in DATABASE_URL:
         _connect_args["timeout"] = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
@@ -49,16 +55,13 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False,
 )
 
-
 class Base(DeclarativeBase):
     pass
-
 
 async def get_session() -> AsyncSession:
     """Dependency-генератор сессии для FastAPI."""
     async with AsyncSessionLocal() as session:
         yield session
-
 
 def is_postgres() -> bool:
     """Проверка, используется ли PostgreSQL."""
