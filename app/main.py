@@ -3160,6 +3160,9 @@ async def web_widget_webhook(
     session.add(msg)
     await session.flush()
 
+    # Сброс таймера для выгрузки в ТГ
+    restart_export_timer(conv.id)
+
     # Извлечение контактов и авто-склейка с дублем по email/phone
     client = await session.get(Client, conv.client_id)
     if client:
