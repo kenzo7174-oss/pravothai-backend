@@ -112,7 +112,7 @@ from app.services.push_service import (
     schedule_push,
 )
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
-from app.services.thai_legal_tg_export import thai_legal_tg_export_loop
+from app.services.thai_legal_tg_export import thai_legal_tg_export_loop, restart_export_timer
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
