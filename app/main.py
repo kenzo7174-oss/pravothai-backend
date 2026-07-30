@@ -1566,6 +1566,7 @@ async def create_message(
     )
     session.add(msg)
     await session.commit()
+    restart_export_timer(conversation_id)
     await session.refresh(msg)
 
     if conv.source == "telegram" and conv.social_id and sender != "client":
