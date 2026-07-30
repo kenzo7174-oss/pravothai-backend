@@ -23,11 +23,13 @@ from app.models import Client, Conversation, Message
 log = logging.getLogger(__name__)
 
 TELEGRAM_API = "https://api.telegram.org"
-EXPORT_LOOP_INTERVAL_SECONDS = 90
 EXPORT_IDLE_MINUTES = 10
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 WEB_SOURCES = ("web", "web_widget")
 BOT_SENDERS = frozenset({"bot", "assistant", "operator"})
+
+# Словарь для хранения таймеров в памяти: {conversation_id: task}
+active_timers = {}
 
 
 def _export_enabled() -> bool:
@@ -127,7 +129,44 @@ async def _send_to_telegram(text: str) -> bool:
         return False
 
 
+async def _process_single_conversation(session, conv: Conversation) -> None:
+    """Вспомогательная функция для выгрузки одного диалога"""
+    try:
+        client = conv.client
+        if client is None:
+            return
+
+        unexported = [
+            msg
+            for msg in sorted(conv.messages, key=lambda m: m.created_at or datetime.min)
+            if not getattr(msg, "is_exported_to_tg", False)
+        ]
+        if not unexported:
+            return
+
+        export_text, exported_messages = _build_export_text(client, conv, unexported)
+        if not export_text or not exported_messages:
+            return
+
+        sent = await _send_to_telegram(export_text)
+        if not sent:
+            return
+
+        for msg in exported_messages:
+            msg.is_exported_to_tg = True
+        await session.commit()
+        log.info(
+            "Thai Legal TG export: conv_id=%s messages=%s",
+            conv.id,
+            len(exported_messages),
+        )
+    except Exception as exc:
+        log.error("Thai Legal TG export error for conv %s: %s", conv.id, exc)
+        await session.rollback()
+
+
 async def _export_pending_conversations() -> None:
+    """Единоразовая проверка 'зависших' диалогов при старте сервера."""
     if not _export_enabled():
         return
 
@@ -150,46 +189,47 @@ async def _export_pending_conversations() -> None:
         conversations = list(result.scalars().unique().all())
 
         for conv in conversations:
-            try:
-                client = conv.client
-                if client is None:
-                    continue
+            await _process_single_conversation(session, conv)
 
-                unexported = [
-                    msg
-                    for msg in sorted(conv.messages, key=lambda m: m.created_at or datetime.min)
-                    if not getattr(msg, "is_exported_to_tg", False)
-                ]
-                if not unexported:
-                    continue
 
-                export_text, exported_messages = _build_export_text(client, conv, unexported)
-                if not export_text or not exported_messages:
-                    continue
-
-                sent = await _send_to_telegram(export_text)
-                if not sent:
-                    continue
-
-                for msg in exported_messages:
-                    msg.is_exported_to_tg = True
-                await session.commit()
-                log.info(
-                    "Thai Legal TG export: conv_id=%s messages=%s",
-                    conv.id,
-                    len(exported_messages),
+async def _wait_and_export(conv_id: int):
+    """Спит 10 минут в памяти, затем выгружает конкретный диалог."""
+    try:
+        await asyncio.sleep(EXPORT_IDLE_MINUTES * 60)
+        
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Conversation)
+                .where(Conversation.id == conv_id)
+                .options(
+                    selectinload(Conversation.client),
+                    selectinload(Conversation.messages),
                 )
-            except Exception as exc:
-                log.error("Thai Legal TG export error for conv %s: %s", conv.id, exc)
-                await session.rollback()
+            )
+            conv = result.scalar_one_or_none()
+            if conv:
+                await _process_single_conversation(session, conv)
+    except asyncio.CancelledError:
+        pass  # Таймер отменили новым сообщением
+    finally:
+        active_timers.pop(conv_id, None)
+
+
+def restart_export_timer(conv_id: int):
+    """Запускает или обновляет таймер диалога. База в этот момент спит."""
+    if not _export_enabled():
+        return
+        
+    if conv_id in active_timers:
+        active_timers[conv_id].cancel()
+        
+    active_timers[conv_id] = asyncio.create_task(_wait_and_export(conv_id))
 
 
 async def thai_legal_tg_export_loop() -> None:
-    """Периодически отправляет завершённые диалоги веб-виджета в Telegram."""
-    while True:
-        await asyncio.sleep(EXPORT_LOOP_INTERVAL_SECONDS)
-        try:
-            await _export_pending_conversations()
-        except Exception as exc:
-            log.error("Thai Legal TG export loop error: %s", exc)
+    """Оставлено для обратной совместимости в main.py. Запускается 1 раз при старте."""
+    try:
+        await _export_pending_conversations()
+    except Exception as exc:
+        log.error("Thai Legal TG on_startup export error: %s", exc)
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
