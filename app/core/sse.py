@@ -34,7 +34,7 @@ class SSEManager:
     async def broadcast(self, event: str, data: dict | None = None) -> None:
         """Рассылает событие всем подключённым клиентам."""
         payload = json.dumps({"event": event, "data": data or {}})
-        log.info("SSE broadcast: event=%s data=%s clients=%d", event, data, len(self._queues))
+        log.info("SSE broadcast: event=%s clients=%d", event, len(self._queues))
         for q in list(self._queues):
             try:
                 q.put_nowait(payload)
