@@ -247,7 +247,18 @@
         const bubble = document.createElement('div');
         bubble.className = 'message ' + sender;
         // Plain text keeps document/model/user content out of executable HTML.
-        bubble.textContent = text;
+        for (const part of String(text).split(/(https:\/\/[^\s<>]+)/g)) {
+            if (sender === 'bot' && part.startsWith('https://')) {
+                const link = document.createElement('a');
+                link.href = part;
+                link.textContent = part;
+                link.target = '_blank';
+                link.rel = 'noopener noreferrer';
+                bubble.appendChild(link);
+            } else {
+                bubble.appendChild(document.createTextNode(part));
+            }
+        }
         bubble.style.whiteSpace = 'pre-wrap';
         messages.appendChild(bubble);
         requestAnimationFrame(scrollToLatest);

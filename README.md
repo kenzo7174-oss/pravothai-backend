@@ -5,15 +5,29 @@ Forked from AidarSig/axolotl-backend.
 
 ## Legal answers
 
-Set `OPENAI_VECTOR_STORE_ID` to the existing Thai Law Bot vector store.
-This enables Responses API with mandatory file search for each question.
-An answer is shown only when the model reports sufficient information and
-its evidence quotations are present in the returned search passages.
-Missing information or a lookup failure offers the contact form instead.
-This does not verify that the uploaded source materials are legally current.
+The configured legal mode checks official Thai government sources using live
+Responses API web search at question time, with a restricted domain allowlist.
+Royal Gazette and the Office of the Council of State provide legal texts;
+MFA, Immigration Bureau and official embassies provide entry requirements.
+The current date in Thailand is supplied to the model. It must check effective
+dates, applicability and subsequent changes, rather than repeat an old summary.
 
-The original general-purpose Axoloti mode is preserved when no vector store
-is configured. **Always configure the vector store for the legal website.**
+- A supported simple answer is shown with verified official source links.
+- A missing detail in a simple question triggers one clarification question.
+- Unconfirmed information, unresolved contradictions or a complex individual
+  case offers the existing contact form for a representative.
+
+The backend rejects answers whose supplied URLs
+are not official URLs actually returned by that question's web-search tool.
+This validates provenance, not the legal correctness of every model statement;
+live search cannot guarantee a complete search of all current Thai legislation.
+The old static vector store is not used as authority for current rules.
+For compatibility, a configured `OPENAI_VECTOR_STORE_ID` selects this legal mode.
+The original general-purpose mode is preserved when that setting is empty.
+
+Web search is charged by OpenAI separately from free Render hosting. Each
+question is capped at three search-tool calls and 2,500 output tokens (including reasoning). Legal search uses `gpt-5-mini`
+for supported source metadata; other existing AI utilities retain their model setting.
 
 ## Render configuration
 
@@ -23,7 +37,7 @@ is configured. **Always configure the vector store for the legal website.**
   `DEFAULT_ADMIN_PASSWORD`; store these only in Render environment variables.
 - Set `APP_ENV=production`, `USE_NULL_POOL=true`, `ENABLE_TELEGRAM_EXPORT=false`,
   `TELEGRAM_WEBHOOK_AUTOMATION_ENABLED=false`.
-- Set `OPENAI_VECTOR_STORE_ID` to the existing store ID and
+- Keep `OPENAI_VECTOR_STORE_ID` configured to select legal mode and
   `OPENAI_CHAT_MODEL=gpt-4o`; the old assistant ID is not used in this mode.
 - Set `BASE_URL` to the actual deployed service URL.
 

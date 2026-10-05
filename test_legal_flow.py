@@ -10,19 +10,18 @@ from openai import AsyncOpenAI
 from app.services import openai_service
 
 
-def response_fixture(answered=True, evidence=None, results=True):
-    text = "Оверстей: штраф 500 бат в день, максимум 20 000 бат."
+def response_fixture(decision="answer", source="https://www.mfa.go.th/en/content/visa", results=True, listed=None):
     return {
         "id": "resp_test", "object": "response", "created_at": 0,
         "status": "completed", "model": "gpt-4o",
-        "output": ([{"id": "fs_test", "type": "file_search_call",
-                     "status": "completed", "queries": ["оверстей"],
-                     "results": [{"file_id": "file_test", "filename": "laws.txt",
-                                  "score": 0.9, "text": text}]}] if results else []) + [
+        "output": ([{"id": "ws_test", "type": "web_search_call",
+                     "status": "completed", "action": {"type": "search", "query": "Thai visa",
+                     "sources": [{"type": "url", "url": listed or source}]}}] if results else []) + [
             {"id": "msg_test", "type": "message", "role": "assistant",
              "status": "completed", "content": [{"type": "output_text",
-                "text": json.dumps({"answered": answered, "message": "Штраф — 500 бат в день.",
-                                    "evidence": evidence if evidence is not None else [text]}),
+                "text": json.dumps({"decision": decision,
+                    "message": "У вас паспорт какой страны?" if decision == "clarify" else "Краткий ответ по официальному источнику.",
+                    "sources": [source] if decision == "answer" else []}),
                 "annotations": []}]}],
     }
 
@@ -31,39 +30,60 @@ class LegalAnswers(unittest.IsolatedAsyncioTestCase):
     async def ask(self, fixture):
         def transport(request):
             if request.url.path == "/v1/responses":
+                request_body = json.loads(request.content)
+                self.assertEqual(request_body["tools"][0]["type"], "web_search")
+                self.assertIn("mfa.go.th", request_body["tools"][0]["filters"]["allowed_domains"])
+                self.assertEqual(request_body["tool_choice"], "required")
                 return httpx.Response(200, json=fixture)
-            return httpx.Response(200, json={"id": "chat_test", "object": "chat.completion",
-                "created": 0, "model": "gpt-4o", "choices": [{"index": 0,
-                "finish_reason": "stop", "message": {"role": "assistant",
-                "content": '{"message":"Legacy answer without knowledge search","request_operator":false}'}}]})
+            raise AssertionError("Legal questions must use Responses with official web search")
         client = AsyncOpenAI(api_key="test-only", max_retries=0,
                             http_client=httpx.AsyncClient(transport=httpx.MockTransport(transport)))
         with patch.object(openai_service.settings, "OPENAI_VECTOR_STORE_ID", "vs_test", create=True), \
              patch.object(openai_service.settings, "OPENAI_API_KEY", "test-only"), \
              patch.object(openai_service, "get_openai_client", return_value=client):
-            raw = await openai_service._run_assistant_on_history([("user", "Штраф за оверстей?")])
+            raw = await openai_service._run_assistant_on_history([("user", "Сколько дней для туриста?")])
             answer = openai_service._parse_assistant_output(raw)
         await client.close()
         return answer
 
-    async def test_supported_answer_is_shown_without_transfer(self):
-        self.assertEqual(await self.ask(response_fixture()), ("Штраф — 500 бат в день.", False))
+    async def test_supported_answer_has_verified_official_link(self):
+        reply, transfer = await self.ask(response_fixture())
+        self.assertIn("Краткий ответ", reply)
+        self.assertIn("https://www.mfa.go.th/en/content/visa", reply)
+        self.assertFalse(transfer)
 
-    async def test_no_explicit_answer_offers_contact_without_automatic_transfer(self):
-        reply, transfer = await self.ask(response_fixture(answered=False))
-        self.assertIn("имя", reply.lower())
-        self.assertIn("телефон", reply.lower())
+    async def test_simple_ambiguous_question_asks_clarification_without_form(self):
+        from app.services.legal_knowledge import needs_contact_form
+        reply, transfer = await self.ask(response_fixture(decision="clarify"))
+        self.assertEqual(reply, "У вас паспорт какой страны?")
+        self.assertFalse(needs_contact_form(reply))
+        self.assertFalse(transfer)
+
+    async def test_visa_clarification_uses_clear_fixed_question(self):
+        reply, _ = await self.ask(response_fixture(decision="clarify_entry"))
+        self.assertEqual(reply, "Какой у вас паспорт и речь о безвизовом въезде или туристической визе TR?")
+
+    async def test_complex_or_unconfirmed_question_offers_representative(self):
+        from app.services.legal_knowledge import needs_contact_form
+        reply, transfer = await self.ask(response_fixture(decision="contact"))
+        self.assertTrue(needs_contact_form(reply))
+        self.assertIn("представитель", reply)
         self.assertFalse(transfer)
 
     async def test_answer_without_search_results_is_not_shown(self):
+        from app.services.legal_knowledge import needs_contact_form
         reply, _ = await self.ask(response_fixture(results=False))
-        self.assertNotIn("Штраф —", reply)
-        self.assertIn("имя", reply.lower())
+        self.assertTrue(needs_contact_form(reply))
 
-    async def test_fabricated_evidence_is_not_shown(self):
-        reply, _ = await self.ask(response_fixture(evidence=["Несуществующее правило"]))
-        self.assertNotIn("Штраф —", reply)
-        self.assertIn("имя", reply.lower())
+    async def test_unofficial_lookalike_source_is_not_shown(self):
+        from app.services.legal_knowledge import needs_contact_form
+        reply, _ = await self.ask(response_fixture(source="https://mfa.go.th.example.com/visa"))
+        self.assertTrue(needs_contact_form(reply))
+
+    async def test_invented_official_url_is_not_shown(self):
+        from app.services.legal_knowledge import needs_contact_form
+        reply, _ = await self.ask(response_fixture(listed="https://www.mfa.go.th/en/content/other"))
+        self.assertTrue(needs_contact_form(reply))
 
 
 class ContactSubmission(unittest.IsolatedAsyncioTestCase):
