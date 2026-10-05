@@ -27,6 +27,7 @@ from sqlalchemy import select
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models import Conversation, Message, SystemSettings
+from app.services.legal_knowledge import generate_legal_reply
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -302,6 +303,9 @@ async def generate_assistant_reply(
         log.warning("Пустое сообщение для OpenAI")
         return None, thread_id
 
+    if settings.OPENAI_VECTOR_STORE_ID:
+        return await _run_assistant_on_history([("user", text)]), None
+
     if not _uses_assistants_api():
         try:
             reply = await _generate_chat_reply(text, additional_instructions=additional_instructions)
@@ -369,6 +373,12 @@ async def _run_assistant_on_history(
     api_key = settings.OPENAI_API_KEY
     if not api_key or not history:
         return None
+
+    if settings.OPENAI_VECTOR_STORE_ID:
+        client = get_openai_client()
+        if client is None:
+            return None
+        return await generate_legal_reply(client, history, settings.OPENAI_VECTOR_STORE_ID, _get_chat_model())
 
     if not _uses_assistants_api():
         return await _run_chat_on_history(history, additional_instructions=additional_instructions)
