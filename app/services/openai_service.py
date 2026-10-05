@@ -378,7 +378,7 @@ async def _run_assistant_on_history(
         client = get_openai_client()
         if client is None:
             return None
-        return await generate_legal_reply(client, history, settings.OPENAI_VECTOR_STORE_ID, _get_chat_model())
+        return await generate_legal_reply(client, history)
 
     if not _uses_assistants_api():
         return await _run_chat_on_history(history, additional_instructions=additional_instructions)
