@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from pydantic import ValidationError
 from fastapi import BackgroundTasks, FastAPI, Depends, HTTPException, Query, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -61,6 +62,7 @@ from app.models import (
     DEFAULT_SENIOR_WELCOME_MESSAGE,
 )
 from app.schemas import (
+    WebContactRequest,
     BroadcastHistorySchema,
     BroadcastRequest,
     CheckLoginRequest,
@@ -105,6 +107,7 @@ from app.services.ai_dispatcher import (
 )
 from app.services.telegram import send_telegram_message, download_telegram_file, set_telegram_webhook
 from app.services.openai_service import auto_tag_conversation, check_offline_block, generate_draft, transcribe_voice
+from app.services.legal_knowledge import CONTACT_CONFIRMATION, needs_contact_form
 from app.services.push_service import (
     push_new_conversation,
     push_new_message,
@@ -112,7 +115,7 @@ from app.services.push_service import (
     schedule_push,
 )
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
-from app.services.thai_legal_tg_export import thai_legal_tg_export_loop, restart_export_timer
+from app.services.thai_legal_tg_export import thai_legal_tg_export_loop, restart_export_timer, send_contact_notification
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
 from app.api.endpoints import ai as ai_endpoints
 from app.core.sse import sse_manager
@@ -2956,7 +2959,8 @@ async def web_widget_sse_stream(
                             continue
 
                         payload = json.dumps(
-                            {"text": msg.content, "sender": sender},
+                            {"id": msg.id, "text": msg.content, "sender": sender,
+                             "show_contact_form": sender == "bot" and needs_contact_form(msg.content)},
                             ensure_ascii=False,
                         )
                         yield f"data: {payload}\n\n"
@@ -3032,6 +3036,7 @@ async def web_widget_poll_messages(
 @app.post("/api/v1/webhooks/web")
 async def web_widget_webhook(
     request: Request,
+    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_session),
 ):
     """Принимает сообщения с веб-виджета на сайте.
@@ -3045,7 +3050,23 @@ async def web_widget_webhook(
         log.warning("web_widget_webhook invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    text = (body.get("message") or "").strip()
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="JSON object is required")
+    contact = None
+    if "contact" in body:
+        try:
+            contact = WebContactRequest.model_validate(body["contact"])
+        except ValidationError:
+            raise HTTPException(status_code=422, detail="Проверьте имя, телефон, почту и вопрос")
+        if not isinstance(body.get("client_id"), str) or not 1 <= len(body["client_id"].strip()) <= 100:
+            raise HTTPException(status_code=422, detail="client_id is required")
+    text_value = body.get("message", "")
+    if not isinstance(text_value, str):
+        raise HTTPException(status_code=422, detail="message must be text")
+    text = text_value.strip()
+    if contact:
+        text = (f"Заявка на связь\nИмя: {contact.name}\nТелефон: {contact.phone}\n"
+                f"Почта: {contact.email}\nВопрос: {contact.question}")
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
@@ -3150,6 +3171,19 @@ async def web_widget_webhook(
         session.add(conv)
         await session.flush()
 
+    if contact and conv.specialist_requested and conv.intercept_mode == INTERCEPT_MODE_MANUAL:
+        # ponytail: deduplicates sequential retries; use a unique request ID for concurrent submissions.
+        previous = await session.get(Message, conv.last_ai_handled_message_id) if conv.last_ai_handled_message_id else None
+        if previous and previous.content == text:
+            confirmation = await session.scalar(select(Message).where(
+                Message.conversation_id == conv.id, Message.sender == "bot",
+                Message.content == CONTACT_CONFIRMATION, Message.id > previous.id,
+            ).order_by(Message.id.desc()).limit(1))
+            if confirmation:
+                background_tasks.add_task(send_contact_notification, previous.id)
+                return {"reply": CONTACT_CONFIRMATION, "thread_id": f"conv-{conv.id}",
+                        "contact_received": True, "message_id": confirmation.id}
+
     conv.last_interaction_at = datetime.now(timezone.utc).replace(tzinfo=None)
     msg = Message(
         conversation_id=conv.id,
@@ -3166,7 +3200,17 @@ async def web_widget_webhook(
 
     # Извлечение контактов и авто-склейка с дублем по email/phone
     client = await session.get(Client, conv.client_id)
-    if client:
+    if contact:
+        client.name, client.phone, client.email = contact.name, contact.phone, contact.email
+        conv.has_new_contact = True
+        conv.specialist_requested = True
+        conv.specialist_requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        conv.intercept_mode = INTERCEPT_MODE_MANUAL
+        conv.last_ai_handled_message_id = msg.id
+        confirmation_msg = Message(conversation_id=conv.id, content=CONTACT_CONFIRMATION,
+                                   sender="bot", is_read=False, is_voice=False)
+        session.add(confirmation_msg)
+    elif client:
         client = await _apply_contacts_and_auto_merge(session, client, text)
 
     # Детектор контактов: телефон или email в сообщении
@@ -3191,6 +3235,13 @@ async def web_widget_webhook(
             if c:
                 client_data = ClientSchema.model_validate(c).model_dump(mode="json")
                 await sse_manager.broadcast("client_updated", {"client": client_data})
+
+    if contact:
+        await sse_manager.broadcast("chat_updated", {"conversation_id": conv.id})
+        schedule_push(push_specialist_requested(conv.id))
+        background_tasks.add_task(send_contact_notification, msg.id)
+        return {"reply": CONTACT_CONFIRMATION, "thread_id": f"conv-{conv.id}",
+                "contact_received": True, "message_id": confirmation_msg.id}
 
     if conv.intercept_mode in {INTERCEPT_MODE_MANUAL, INTERCEPT_MODE_SENIOR}:
         did_wakeup = await _check_and_auto_wakeup_manual_mode(session, conv)
@@ -3318,6 +3369,8 @@ async def web_widget_webhook(
     return {
         "reply": content_to_reply or "Извините, не удалось сформировать ответ. Попробуйте позже.",
         "thread_id": f"conv-{conv.id}",
+        "show_contact_form": needs_contact_form(content_to_reply),
+        "message_id": ai_msg.id if request_operator or draft else None,
     }
 
 

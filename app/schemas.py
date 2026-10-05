@@ -6,8 +6,31 @@ Axoloti Terminal — Pydantic-схемы для сериализации дан�
 """
 
 from datetime import datetime
+import re
 from typing import Literal, Optional, Union
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+class WebContactRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    name: str = Field(min_length=1, max_length=100)
+    phone: str = Field(min_length=7, max_length=40)
+    email: str = Field(min_length=3, max_length=254)
+    question: str = Field(min_length=1, max_length=4000)
+
+    @field_validator("email")
+    @classmethod
+    def valid_email(cls, value: str) -> str:
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            raise ValueError("Некорректная почта")
+        return value
+
+    @field_validator("phone")
+    @classmethod
+    def valid_phone(cls, value: str) -> str:
+        if not re.fullmatch(r"\+?[0-9 ()\-]+", value) or not 7 <= len(re.sub(r"[^0-9]", "", value)) <= 15:
+            raise ValueError("Некорректный номер телефона")
+        return value
 
 
 class LoginRequest(BaseModel):
