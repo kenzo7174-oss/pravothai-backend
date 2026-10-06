@@ -197,36 +197,19 @@
 #close-chat-btn:focus-visible { outline-color: white; }
 #chat-input { min-width: 0; }
 #legal-chat-window { box-sizing: border-box; }
-@media (max-width: 480px) {
-    #legal-chat-window.contact-mode {
-        inset: 0; width: 100%; height: 100vh; height: 100dvh; max-height: none; border-radius: 0;
-    }
-}
-#legal-chat-window.contact-mode .chat-messages,
-#legal-chat-window.contact-mode .chat-input-area,
-#legal-chat-window.contact-mode .typing-indicator { display: none !important; }
-.legal-contact-form[hidden] { display: none; }
 .legal-contact-form {
     box-sizing: border-box; display: flex; flex-direction: column;
-    flex: 1; min-height: 0; width: 100%; margin: 0; color: #1a1a1a;
-    font-size: 14.5px; line-height: 1.5;
+    flex-shrink: 0; width: 100%; max-width: 100%; margin: 0; padding: 16px;
 }
-.legal-contact-fields { flex: 1; min-height: 0; overflow-y: auto; padding: 20px 16px; overscroll-behavior: contain; }
 .legal-contact-fields h2 { margin: 0; font-size: 16px; line-height: 1.4; }
-.legal-contact-actions {
-    flex-shrink: 0; display: flex; gap: 12px; flex-wrap: wrap; padding: 16px;
-    padding-bottom: max(16px, env(safe-area-inset-bottom)); background: #fff;
-    border-top: 1px solid rgba(0,0,0,0.05);
-}
-.legal-contact-form .legal-contact-actions button { margin-top: 0; flex: 1; }
-.legal-contact-form .legal-contact-back { background: #f0f2f5; color: #213b61; }
+.legal-contact-actions { display: flex; }
+.legal-contact-actions button { flex: 1; }
 .legal-contact-fields [role="status"]:empty { display: none; }
-.legal-contact-open { min-height: 44px; padding: 12px 16px; border: 0; border-radius: 12px;
-    background: #213b61; color: #fff; font: inherit; cursor: pointer; align-self: flex-start; }
+.chat-input-area { flex-shrink: 0; }
 .chat-messages { min-height: 0; }
 @media (max-width: 480px) {
     #legal-chat-window { height: 100dvh !important; }
-    .legal-contact-form input, .legal-contact-form textarea { font-size: 16px; }
+    #legal-chat-window .legal-contact-form input, #legal-chat-window .legal-contact-form textarea { font-size: 16px; }
 }
 .legal-contact-form label { display: block; margin-top: 12px; }
 .legal-contact-form input, .legal-contact-form textarea {
@@ -269,7 +252,6 @@
     let lastQuestion = '';
     let contactForm = null;
     let eventSource = null;
-    let contactOpenButton = null;
     const seenMessages = new Set();
 
     function scrollToLatest() { messages.scrollTop = messages.scrollHeight; }
@@ -301,7 +283,7 @@
         if (tooltip) tooltip.classList.remove('visible');
         chat.style.display = opening ? 'flex' : 'none';
         chatBtn.setAttribute('aria-expanded', String(opening));
-        (opening ? (chat.classList.contains('contact-mode') ? contactForm.querySelector('h2') : input) : chatBtn).focus();
+        (opening ? input : chatBtn).focus();
     }
     chatBtn.style.display = 'flex';
     chatBtn.style.opacity = '1';
@@ -309,15 +291,7 @@
     closeBtn.addEventListener('click', toggleChat);
     chat.addEventListener('keydown', event => {
         if (event.key === 'Escape') { event.preventDefault(); toggleChat(); }
-        if (event.key === 'Tab' && chat.classList.contains('contact-mode')) {
-            const controls = [closeBtn, ...contactForm.querySelectorAll('input, textarea, button:not(:disabled)')];
-            const first = controls[0], last = controls[controls.length - 1];
-            if (event.shiftKey && (document.activeElement === first || document.activeElement === contactForm.querySelector('h2'))) {
-                event.preventDefault(); last.focus();
-            } else if (!event.shiftKey && document.activeElement === last) {
-                event.preventDefault(); first.focus();
-            }
-        }
+
     });
     if (tooltip) {
         tooltip.addEventListener('click', () => chatBtn.click());
@@ -387,13 +361,12 @@
 
     function showContactForm() {
         if (contactForm) {
-            chat.classList.add('contact-mode');
-            contactForm.hidden = false;
-            contactForm.querySelector('h2').focus();
+            messages.scrollTop = Math.max(0, contactForm.offsetTop - messages.offsetTop - 100);
+            contactForm.querySelector('h2').focus({preventScroll: true});
             return;
         }
         const form = document.createElement('form');
-        form.className = 'legal-contact-form';
+        form.className = 'message bot legal-contact-form';
         form.setAttribute('aria-label', 'Заявка специалисту');
         const fields = document.createElement('div');
         fields.className = 'legal-contact-fields';
@@ -431,17 +404,7 @@
         submit.textContent = 'Связаться';
         const actions = document.createElement('div');
         actions.className = 'legal-contact-actions';
-        const back = document.createElement('button');
-        back.type = 'button';
-        back.className = 'legal-contact-back';
-        back.textContent = 'Вернуться в чат';
-        back.addEventListener('click', () => {
-            chat.classList.remove('contact-mode');
-            form.hidden = true;
-            contactOpenButton.focus();
-            scrollToLatest();
-        });
-        actions.append(back, submit);
+        actions.appendChild(submit);
         const status = document.createElement('p');
         status.setAttribute('role', 'status');
         fields.appendChild(status);
@@ -464,9 +427,6 @@
                 connectSSE();
                 form.remove();
                 contactForm = null;
-                chat.classList.remove('contact-mode');
-                contactOpenButton.remove();
-                contactOpenButton = null;
                 input.focus();
                 scrollToLatest();
             } catch (_) {
@@ -476,15 +436,11 @@
             }
         });
         contactForm = form;
-        contactOpenButton = document.createElement('button');
-        contactOpenButton.type = 'button';
-        contactOpenButton.className = 'legal-contact-open';
-        contactOpenButton.textContent = 'Связаться со специалистом';
-        contactOpenButton.addEventListener('click', showContactForm);
-        messages.appendChild(contactOpenButton);
-        chat.appendChild(form);
-        chat.classList.add('contact-mode');
-        heading.focus();
+        messages.appendChild(form);
+        requestAnimationFrame(() => {
+            messages.scrollTop = Math.max(0, form.offsetTop - messages.offsetTop - 100);
+            heading.focus({preventScroll: true});
+        });
     }
     connectSSE();
 })();

@@ -66,8 +66,9 @@ and startup retries pending dialogues. Render Free may pause background work.
 
 Replace the old widget block with `pravothai-widget-tilda.html` after backend
 verification. Update `API_BASE_URL` in that file to the verified service URL.
-The contact screen fills the chat panel on desktop and the viewport on mobile,
-with scrollable fields and persistent actions. The widget offers required name,
+The contact form is inserted directly into the message history, below the bot
+reply. The existing chat scrolls to reach every field and the submit button;
+opening the form keeps the conversation and chat input visible. The widget offers required name,
 phone, email and question fields, retains
 values on a failed submission and confirms only a saved CRM request.
 
