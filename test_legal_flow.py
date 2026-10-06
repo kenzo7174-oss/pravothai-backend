@@ -26,11 +26,19 @@ def response_fixture(decision="answer", source="https://www.mfa.go.th/en/content
     }
 
 
+def route_fixture(route):
+    result = response_fixture(results=False)
+    result["output"][0]["content"][0]["text"] = json.dumps({"route": route})
+    return result
+
+
 class LegalAnswers(unittest.IsolatedAsyncioTestCase):
     async def ask(self, fixture):
         def transport(request):
             if request.url.path == "/v1/responses":
                 request_body = json.loads(request.content)
+                if request_body["text"]["format"]["name"] == "question_route":
+                    return httpx.Response(200, json=route_fixture("legal"))
                 self.assertEqual(request_body["tools"][0]["type"], "web_search")
                 self.assertIn("mfa.go.th", request_body["tools"][0]["filters"]["allowed_domains"])
                 self.assertEqual(request_body["tool_choice"], "required")
@@ -84,6 +92,45 @@ class LegalAnswers(unittest.IsolatedAsyncioTestCase):
         from app.services.legal_knowledge import needs_contact_form
         reply, _ = await self.ask(response_fixture(listed="https://www.mfa.go.th/en/content/other"))
         self.assertTrue(needs_contact_form(reply))
+
+
+class GeneralAnswers(unittest.IsolatedAsyncioTestCase):
+    async def test_general_question_uses_unrestricted_search_without_contact_form(self):
+        from app.services.legal_knowledge import generate_legal_reply, needs_contact_form
+        seen = []
+        def transport(request):
+            body = json.loads(request.content)
+            seen.append(body)
+            if body.get("text", {}).get("format", {}).get("name") == "question_route":
+                return httpx.Response(200, json=route_fixture("general"))
+            self.assertEqual(body["tool_choice"], "auto")
+            self.assertNotIn("filters", body["tools"][0])
+            self.assertIn("только о повседневной жизни и поездках в Таиланде", body["instructions"])
+            result = response_fixture(results=False)
+            result["output"][0]["content"][0]["text"] = "Здравствуйте! Чем помочь в Таиланде?"
+            return httpx.Response(200, json=result)
+        client = AsyncOpenAI(api_key="test-only", max_retries=0,
+                            http_client=httpx.AsyncClient(transport=httpx.MockTransport(transport)))
+        reply = json.loads(await generate_legal_reply(client, [("user", "Привет!")]))["message"]
+        await client.close()
+        self.assertEqual(len(seen), 2)
+        self.assertFalse(needs_contact_form(reply))
+        self.assertIn("Здравствуйте", reply)
+
+    async def test_router_failure_falls_back_to_verified_legal_mode(self):
+        from app.services.legal_knowledge import generate_legal_reply
+        def transport(request):
+            body = json.loads(request.content)
+            if body.get("text", {}).get("format", {}).get("name") == "question_route":
+                return httpx.Response(503, json={"error": {"message": "Test routing failure"}})
+            self.assertEqual(body["tool_choice"], "required")
+            self.assertIn("mfa.go.th", body["tools"][0]["filters"]["allowed_domains"])
+            return httpx.Response(200, json=response_fixture())
+        client = AsyncOpenAI(api_key="test-only", max_retries=0,
+                            http_client=httpx.AsyncClient(transport=httpx.MockTransport(transport)))
+        reply = json.loads(await generate_legal_reply(client, [("user", "Какие штрафы?")]))["message"]
+        await client.close()
+        self.assertIn("Официальные источники", reply)
 
 
 class ContactSubmission(unittest.IsolatedAsyncioTestCase):
