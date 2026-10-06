@@ -218,7 +218,7 @@ class ContactSubmission(unittest.IsolatedAsyncioTestCase):
                 message = await session.scalar(select(Message).where(Message.sender == "client"))
                 self.assertFalse(message.is_exported_to_tg)
             sender.return_value = True
-            await telegram.thai_legal_tg_export_loop()
+            await telegram._retry_pending_contacts()
             self.assertEqual(sender.await_count, 2)
             async with self.sessions() as session:
                 message = await session.scalar(select(Message).where(Message.sender == "client"))
@@ -236,6 +236,17 @@ class ContactSubmission(unittest.IsolatedAsyncioTestCase):
 
 
 class DialogueExport(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_retries_after_failure_without_new_question(self):
+        from app.services import thai_legal_tg_export as export
+        with patch.object(export, "_retry_pending_contacts", new_callable=AsyncMock), \
+             patch.object(export, "_export_pending_conversations", new_callable=AsyncMock,
+                          side_effect=[RuntimeError("temporary"), None]) as pending, \
+             patch.object(export.asyncio, "sleep", new_callable=AsyncMock,
+                          side_effect=[None, asyncio.CancelledError]):
+            with self.assertRaises(asyncio.CancelledError):
+                await export.thai_legal_tg_export_loop()
+            self.assertEqual(pending.await_count, 2)
+
     async def test_restarting_idle_timer_keeps_replacement_registered(self):
         from app.services import thai_legal_tg_export as export
         try:
