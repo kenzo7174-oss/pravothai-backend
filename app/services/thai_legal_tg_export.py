@@ -32,7 +32,7 @@ BOT_SENDERS = frozenset({"bot", "assistant", "operator"})
 
 # Словарь для хранения таймеров в памяти: {conversation_id: task}
 active_timers = {}
-_contact_send_lock = asyncio.Lock()
+_delivery_lock = asyncio.Lock()
 
 
 def _export_enabled() -> bool:
@@ -137,7 +137,7 @@ async def send_contact_notification(message_id: int) -> None:
         log.warning("Contact notification: Telegram settings are missing")
         return
     # ponytail: one process serializes sends; use a DB outbox when running multiple replicas.
-    async with _contact_send_lock:
+    async with _delivery_lock:
         try:
             async with AsyncSessionLocal() as session:
                 message = await session.get(Message, message_id)
@@ -203,30 +203,32 @@ async def _process_single_conversation(session, conv: Conversation) -> None:
 
 
 async def _export_pending_conversations() -> None:
-    """Единоразовая проверка 'зависших' диалогов при старте сервера."""
+    """Retry saved dialogues after the idle period, including lost timers."""
     if not _export_enabled():
         return
 
     now = datetime.now(timezone.utc)
     cutoff_naive = (now - timedelta(minutes=EXPORT_IDLE_MINUTES)).replace(tzinfo=None)
 
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(Conversation)
-            .where(
-                Conversation.source.in_(WEB_SOURCES),
-                Conversation.last_interaction_at.isnot(None),
-                Conversation.last_interaction_at < cutoff_naive,
+    async with _delivery_lock:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(Conversation)
+                .where(
+                    Conversation.source.in_(WEB_SOURCES),
+                    Conversation.last_interaction_at.isnot(None),
+                    Conversation.last_interaction_at < cutoff_naive,
+                    Conversation.messages.any(Message.is_exported_to_tg.is_(False)),
+                )
+                .options(
+                    selectinload(Conversation.client),
+                    selectinload(Conversation.messages),
+                )
             )
-            .options(
-                selectinload(Conversation.client),
-                selectinload(Conversation.messages),
-            )
-        )
-        conversations = list(result.scalars().unique().all())
+            conversations = list(result.scalars().unique().all())
 
-        for conv in conversations:
-            await _process_single_conversation(session, conv)
+            for conv in conversations:
+                await _process_single_conversation(session, conv)
 
 
 async def _wait_and_export(conv_id: int):
@@ -234,18 +236,19 @@ async def _wait_and_export(conv_id: int):
     try:
         await asyncio.sleep(EXPORT_IDLE_MINUTES * 60)
         
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Conversation)
-                .where(Conversation.id == conv_id)
-                .options(
-                    selectinload(Conversation.client),
-                    selectinload(Conversation.messages),
+        async with _delivery_lock:
+            async with AsyncSessionLocal() as session:
+                result = await session.execute(
+                    select(Conversation)
+                    .where(Conversation.id == conv_id)
+                    .options(
+                        selectinload(Conversation.client),
+                        selectinload(Conversation.messages),
+                    )
                 )
-            )
-            conv = result.scalar_one_or_none()
-            if conv:
-                await _process_single_conversation(session, conv)
+                conv = result.scalar_one_or_none()
+                if conv:
+                    await _process_single_conversation(session, conv)
     except asyncio.CancelledError:
         pass  # Таймер отменили новым сообщением
     finally:
@@ -266,10 +269,13 @@ def restart_export_timer(conv_id: int):
 
 
 async def thai_legal_tg_export_loop() -> None:
-    """Оставлено для обратной совместимости в main.py. Запускается 1 раз при старте."""
-    try:
-        await _retry_pending_contacts()
-        await _export_pending_conversations()
-    except Exception as exc:
-        log.error("Thai Legal TG on_startup export error: %s", exc)
+    """Recover lost timers and retry failed deliveries from saved messages."""
+    log.info("Thai Legal TG export worker: enabled=%s", _export_enabled())
+    while True:
+        try:
+            await _retry_pending_contacts()
+            await _export_pending_conversations()
+        except Exception as exc:
+            log.error("Thai Legal TG export retry failed: type=%s", type(exc).__name__)
+        await asyncio.sleep(60)
 # === DO NOT DELETE: THAI LEGAL BOT EXPORT FEATURE ===
