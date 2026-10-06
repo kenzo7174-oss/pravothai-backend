@@ -61,7 +61,7 @@ class LegalAnswers(unittest.IsolatedAsyncioTestCase):
 
     async def test_visa_clarification_uses_clear_fixed_question(self):
         reply, _ = await self.ask(response_fixture(decision="clarify_entry"))
-        self.assertEqual(reply, "Какой у вас паспорт и речь о безвизовом въезде или туристической визе TR?")
+        self.assertEqual(reply, "Речь о безвизовом въезде или туристической визе TR?")
 
     async def test_complex_or_unconfirmed_question_offers_representative(self):
         from app.services.legal_knowledge import needs_contact_form
