@@ -236,6 +236,22 @@ class ContactSubmission(unittest.IsolatedAsyncioTestCase):
 
 
 class DialogueExport(unittest.IsolatedAsyncioTestCase):
+    async def test_restarting_idle_timer_keeps_replacement_registered(self):
+        from app.services import thai_legal_tg_export as export
+        try:
+            with patch.object(export, "_export_enabled", return_value=True):
+                export.restart_export_timer(999)
+                first = export.active_timers[999]
+                await asyncio.sleep(0)
+                export.restart_export_timer(999)
+                second = export.active_timers[999]
+                await asyncio.gather(first, return_exceptions=True)
+                self.assertIs(export.active_timers.get(999), second)
+        finally:
+            second.cancel()
+            await asyncio.gather(second, return_exceptions=True)
+            export.active_timers.pop(999, None)
+
     async def test_dialogue_without_contact_exports_questions_and_answers_once(self):
         from app.services import thai_legal_tg_export as export
         from datetime import datetime
