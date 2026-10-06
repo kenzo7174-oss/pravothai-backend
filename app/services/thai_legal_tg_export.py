@@ -249,7 +249,9 @@ async def _wait_and_export(conv_id: int):
     except asyncio.CancelledError:
         pass  # Таймер отменили новым сообщением
     finally:
-        active_timers.pop(conv_id, None)
+        # A cancelled old timer must not remove the replacement timer.
+        if active_timers.get(conv_id) is asyncio.current_task():
+            active_timers.pop(conv_id, None)
 
 
 def restart_export_timer(conv_id: int):
