@@ -188,5 +188,39 @@ class ContactSubmission(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await session.scalar(select(func.count()).select_from(Client)), 0)
 
 
+class DialogueExport(unittest.IsolatedAsyncioTestCase):
+    async def test_dialogue_without_contact_exports_questions_and_answers_once(self):
+        from app.services import thai_legal_tg_export as export
+        from datetime import datetime
+        messages = [SimpleNamespace(sender=sender, content=text, is_internal=False,
+                    is_exported_to_tg=False, created_at=datetime(2026, 10, 6))
+                    for sender, text in [("client", "Какая погода на Пхукете?"), ("bot", "Ответ бота")]]
+        client = SimpleNamespace(axolotl_visitor_id="visitor-test", location=None,
+                                 ip=None, os_device=None, browser=None)
+        conv = SimpleNamespace(id=1, client=client, messages=messages)
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        with patch.object(export, "_send_to_telegram", new_callable=AsyncMock, return_value=True) as send:
+            await export._process_single_conversation(session, conv)
+            await export._process_single_conversation(session, conv)
+            send.assert_awaited_once()
+            text = send.call_args.args[0]
+            self.assertIn("Какая погода на Пхукете?", text)
+            self.assertIn("Ответ бота", text)
+            self.assertTrue(all(m.is_exported_to_tg for m in messages))
+
+    async def test_failed_dialogue_export_keeps_messages_pending(self):
+        from app.services import thai_legal_tg_export as export
+        message = SimpleNamespace(sender="client", content="Привет", is_internal=False,
+                                  is_exported_to_tg=False, created_at=None)
+        client = SimpleNamespace(axolotl_visitor_id="visitor-test", location=None,
+                                 ip=None, os_device=None, browser=None)
+        conv = SimpleNamespace(id=1, client=client, messages=[message])
+        session = SimpleNamespace(commit=AsyncMock(), rollback=AsyncMock())
+        with patch.object(export, "_send_to_telegram", new_callable=AsyncMock, return_value=False):
+            await export._process_single_conversation(session, conv)
+        self.assertFalse(message.is_exported_to_tg)
+        session.commit.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

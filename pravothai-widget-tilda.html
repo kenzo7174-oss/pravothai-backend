@@ -197,8 +197,10 @@
 #close-chat-btn:focus-visible { outline-color: white; }
 #chat-input { min-width: 0; }
 #legal-chat-window { box-sizing: border-box; }
-#legal-chat-window.contact-mode {
-    inset: 0; width: 100%; height: 100vh; height: 100dvh; max-height: none; border-radius: 0;
+@media (max-width: 480px) {
+    #legal-chat-window.contact-mode {
+        inset: 0; width: 100%; height: 100vh; height: 100dvh; max-height: none; border-radius: 0;
+    }
 }
 #legal-chat-window.contact-mode .chat-messages,
 #legal-chat-window.contact-mode .chat-input-area,
